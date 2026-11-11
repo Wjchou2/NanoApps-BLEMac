@@ -21,6 +21,16 @@ Includes community work from [nano7-untethered](https://github.com/olievans123/n
 
 To add an app shared by another developer, unzip its app ZIP and copy the `.nanoapp` folder into the Apps folder on the iPod.
 
+## Bluetooth Test and Nano UART Sender
+
+Install [Bluetooth Test](downloads/bluetoothtest.zip) on a NanoApps iPod nano 7
+running firmware 1.1.2. Open [Nano UART Sender](downloads/nano-uart-sender-macos-arm64.zip)
+on an Apple silicon Mac running macOS 15 or later.
+
+On the iPod, tap **Scan BLE**, select **Nano UART**, and tap **Connect**.
+The iPod subscribes to the Mac's Nordic UART service. Type a message and click
+**Send** on the Mac to display it on the iPod over Bluetooth LE.
+
 ## Included Apps
 
 NanoApps ships with a broad collection of apps and games: productivity and reference apps like Notes, Calendar, Wallet, and Elements; creative and utility apps like Paint and Screenshot; arcade, puzzle, card, and board games like 2048, Tetris, Solitaire, and Chess; plus a OpenGL demo app. They group into a few kinds.
