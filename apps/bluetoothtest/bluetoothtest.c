@@ -1,6 +1,7 @@
 /* Classic inquiry and BLE diagnostics on firmware 39A10023. */
 #include "hb_sdk.h"
 #include "hb_shared.h"
+#include "ble_audio.h"
 #include "lvgl/lvgl.h"
 #include <string.h>
 
@@ -736,6 +737,9 @@ static struct {
     bool received;
     char message[LE_TEXT_LIMIT + 1];
     uint32_t started;
+    uint32_t audio_received;
+    ble_audio_state_t audio_state;
+    bool playing_audio;
 } gatt;
 static uintptr_t gatt_observer_storage[10];
 #define gatt_observer_table (gatt_observer_storage + 2)
@@ -814,7 +818,7 @@ static void gatt_notification(uintptr_t observer, uintptr_t device, uintptr_t at
     uint16_t handle = in_sdram(attribute, 6) ? gatt_word(attribute + 4) : 0;
     if (device == gatt.ref && handle &&
         (handle == gatt.characteristic_handle || handle == gatt.value_handle) &&
-        in_sdram((uintptr_t)data, length) && length) {
+        in_sdram((uintptr_t)data, length) && length && !ble_audio_receive(data, length)) {
         unsigned copy_length = length < LE_TEXT_LIMIT ? length : LE_TEXT_LIMIT;
         for (unsigned i = 0; i < copy_length; i++) {
             uint8_t byte = data[i];
@@ -863,8 +867,15 @@ static int finish_gatt(void)
         drop_ble_link(gatt.owner, gatt.session, gatt.ref, gatt.changed_mode);
         ((release_ble_device_fn)LE_RELEASE_DEVICE)(&gatt.ref);
         memset(&gatt, 0, sizeof(gatt));
+        ble_audio_reset();
     }
     return 1;
+}
+
+static int prepare_unload(void)
+{
+    finish_gatt();
+    return ble_audio_release();
 }
 
 static const char *start_gatt(uintptr_t owner, uintptr_t session, uintptr_t central,
@@ -936,12 +947,16 @@ static void poll_gatt(lv_timer_t *timer)
     uint16_t characteristic = gatt.characteristic_handle;
     uint16_t service_start = gatt.service_start;
     uint16_t service_end = gatt.service_end;
+    ble_audio_progress_t audio = ble_audio_progress();
     if (received) {
         memcpy(message, gatt.message, sizeof(message));
         gatt.received = false;
     }
     gatt_unlock(guard);
 
+    if (!phase && (received || audio.received != gatt.audio_received ||
+                   audio.state != gatt.audio_state || ble_audio_playing()))
+        gatt.started = lv_tick_get();
     if (lv_tick_elaps(gatt.started) >= (phase ? 12000u : 60000u)) {
         end_notification_test(phase ? "GATT setup timed out." : "BLE listening timed out.");
         return;
@@ -989,13 +1004,47 @@ static void poll_gatt(lv_timer_t *timer)
             if (!((subscribe_fn)LE_SUBSCRIBE)(gatt.owner, &gatt.ref, characteristic, 1))
                 end_notification_test("Notification subscription rejected.");
         } else {
-            lv_label_set_text(status_label, "Subscribed. Send text from nRF Connect.");
+            lv_label_set_text(status_label, "Subscribed. Send text or audio.");
         }
     }
 
-    if (received && gatt.ref) {
+    if (!gatt.ref || gatt.expected_cookie)
+        return;
+
+    bool audio_changed = audio.state != gatt.audio_state || audio.received != gatt.audio_received;
+    gatt.audio_state = audio.state;
+    gatt.audio_received = audio.received;
+    if (audio.state == BLE_AUDIO_READY) {
+        if (ble_audio_playing()) {
+            lv_label_set_text(status_label, "Clip received. Waiting to play...");
+            return;
+        }
+        gatt.playing_audio = ble_audio_play();
+        lv_label_set_text(status_label, gatt.playing_audio
+                         ? "Playing received audio." : "Could not play received audio.");
+    } else if (audio_changed && audio.state == BLE_AUDIO_RECEIVING) {
+        lv_label_set_text_fmt(status_label, "Receiving audio... %u%%",
+                              (unsigned)(audio.received * 100 / audio.total));
+    } else if (audio.state == BLE_AUDIO_ERROR) {
+        lv_label_set_text(status_label, "Audio incomplete or invalid. Try again.");
+    } else if (audio.state == BLE_AUDIO_CANCELLED) {
+        lv_label_set_text(status_label, "Audio transfer cancelled.");
+    } else if (gatt.playing_audio && !ble_audio_playing()) {
+        gatt.playing_audio = false;
+        ble_audio_release();
+        if (audio.state == BLE_AUDIO_IDLE)
+            lv_label_set_text(status_label, "Audio finished.");
+    } else if (received && audio.state == BLE_AUDIO_IDLE) {
         lv_label_set_text_fmt(status_label, "Received:\n%s", message);
-        gatt.started = lv_tick_get();
+    }
+
+    if (audio.state == BLE_AUDIO_READY || audio.state == BLE_AUDIO_ERROR ||
+        audio.state == BLE_AUDIO_CANCELLED) {
+        gatt_lock(guard);
+        /* A new start packet may have arrived since an error or cancellation. */
+        if (ble_audio_progress().state == audio.state)
+            ble_audio_reset();
+        gatt_unlock(guard);
     }
 }
 
@@ -1112,7 +1161,7 @@ static void finish_connect_test(lv_timer_t *timer)
         stop_polling();
         return;
     }
-    hb_shared->prepare_unload = finish_gatt;
+    hb_shared->prepare_unload = prepare_unload;
     lv_label_set_text(connect_label, "Disconnect");
     lv_obj_remove_state(connect_button, LV_STATE_DISABLED);
     lv_label_set_text(status_label, "BLE link open. Discovering services...");

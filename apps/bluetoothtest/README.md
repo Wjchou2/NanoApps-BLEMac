@@ -42,8 +42,15 @@ running firmware 1.1.2 (`39A10023`).
    `Hello` or the hex bytes `48 65 6C 6C 6F`. Bluetooth Test should show
    **Received** and the message.
 
-The BLE link test worked on hardware. The GATT discovery and notification
-receiver still need an end-to-end hardware run.
+### Play a clip from the Mac
+
+Open the [Nano UART Sender](../../downloads/nano-uart-sender-macos-arm64.zip)
+on an Apple silicon Mac running macOS 15 or later. Connect to **Nano UART**
+on the iPod. When the Mac shows **Subscribed**, click **Send Audio…** and
+choose a clip up to 30 seconds long. The Mac converts it to mono 22.05 kHz
+IMA ADPCM for transfer. The iPod checks the packet offsets and checksum, then
+decodes and plays the clip from memory. Keep Bluetooth Test open during the
+transfer.
 
 The earlier **BLE Test** could read the controller state, but it usually
 showed an empty cache after returning from Fitness. The firmware clears the

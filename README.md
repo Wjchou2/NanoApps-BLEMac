@@ -29,7 +29,8 @@ on an Apple silicon Mac running macOS 15 or later.
 
 On the iPod, tap **Scan BLE**, select **Nano UART**, and tap **Connect**.
 The iPod subscribes to the Mac's Nordic UART service. Type a message and click
-**Send** on the Mac to display it on the iPod over Bluetooth LE.
+**Send** to display it on the iPod, or choose **Send Audio…** to transfer a
+clip up to 30 seconds long. The iPod plays it after the transfer finishes.
 
 ## Included Apps
 
