@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>	<string>org.nanoapps.bluetoothtest</string>
+	<key>CFBundleName</key>		<string>Bluetooth Test</string>
+	<key>CFBundleExecutable</key>	<string>bluetoothtest</string>
+	<key>HBAppKind</key>			<integer>1</integer>
+	<key>HBIconGlyph</key>		<string>tower-broadcast</string>
+	<key>HBIconColor</key>		<string>#69809d</string>
+</dict>
+</plist>
