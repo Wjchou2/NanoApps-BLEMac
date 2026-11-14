@@ -144,6 +144,7 @@
  * preset change, and how much rendering has to fit between one block being
  * linked and the voice reaching it. */
 #define BLOCK_FRAMES 28224u
+#define FILE_OPENING_FRAMES (4u * BLOCK_FRAMES)
 
 /* Blocks in the ring. Two would be enough never to leave the chain empty — one
    sounding, one queued behind it — and the third is slack for a frame that runs
@@ -170,17 +171,16 @@
    147x48, exact for the same rates as BLOCK_FRAMES; 320 ms at 22050. */
 #define QUIET_FRAMES 7056u
 
-#define MS_FRAMES(ms) ((DEVICE_RATE * (uint32_t)(ms)) / 1000u)
+#define MS_FRAMES(ms) ((g_source_rate * (uint32_t)(ms)) / 1000u)
 
 #define SAFETY_FRAMES MS_FRAMES(SAFETY_MS)
 #define FADE_FRAMES   MS_FRAMES(FADE_MS)
 #define CHUNK_FRAMES  MS_FRAMES(CHUNK_MS)
 #define BLOCK_MS      ((BLOCK_FRAMES * 1000u) / DEVICE_RATE)
 
-/* Nothing has run us for this long and the chain has certainly run dry: the OS
-   put another app in front. Whatever was queued finished long ago and unheard,
-   so start clean rather than carrying on from stale state. */
+/* A long gap between UI ticks can hide a complete chain transition. */
 #define STARVED_MS (BLOCK_MS * SLOTS * 3)
+#define DETACH_SETTLE_MS 50u
 
 typedef void *(*sfx_ctor_t)(void *self);
 typedef void *(*sfx_player_inst_t)(void);
@@ -192,12 +192,15 @@ typedef void  (*sfx_player_play_t)(void *player, void *desc,
 #define SLOT_BUILD  1       /* part-rendered */
 #define SLOT_READY  2       /* rendered, not yet handed to the OS */
 #define SLOT_QUEUED 3       /* handed over: sounding, or waiting in the chain */
+#define SLOT_RETIRED 4      /* completion may still be reading the descriptor */
 
 typedef struct {
     uint8_t  desc[0x80];
     int16_t *pcm;
+    uint32_t capacity;
     uint32_t frames;        /* always a multiple of 441 — see FRAMES_MS */
     uint32_t fill;          /* how much is rendered so far */
+    uint32_t retired_ms;
     uint8_t  state;
     bool     seen_playing;  /* the OS has had it: its flag was seen set */
 } slot_t;
@@ -209,6 +212,8 @@ static slot_t g_quiet;              /* self-chained silence, for pause */
    they were linked — so it is an array and a count, not a ring. */
 static uint8_t g_q[SLOTS];
 static uint8_t g_qn;
+static bool g_detached;
+static uint32_t g_detached_ms;
 
 static uint32_t g_head_start_ms;    /* when g_q[0] was first seen sounding */
 static uint32_t g_last_tick_ms;
@@ -217,13 +222,21 @@ static uint64_t g_frames_done;      /* frames of blocks that have FINISHED */
 static en_audio_pull_fn s_pull;
 static void            *s_pull_ctx;
 static bool             s_source_done;
+static bool             s_waiting_for_input;
+static bool             g_refilling;
+static uint32_t         g_refill_started;
 
 static bool g_paused;
+static bool g_stream_pause;
 static bool g_stopping;
 static uint32_t g_out_rate;         /* the mixer's rate, read off a live voice */
 static bool     g_duration_bad;     /* the OS disagreed; stop stating one */
 static uint8_t  g_overrun;          /* consecutive blocks that took too long */
 static bool g_quiet_armed;          /* the silence block is looping */
+static bool g_use_pcm_length;
+static uint32_t g_source_rate = DEVICE_RATE;
+static uint32_t g_block_frames = BLOCK_FRAMES;
+static bool g_short_video_blocks;
 static bool g_fade_in;              /* next block handed over ramps up */
 static int  g_volume = 45;
 static en_audio_state_t g_state = EN_AUDIO_IDLE;
@@ -247,7 +260,7 @@ static uint32_t os_volume(void)
  * out and pads the difference with silence. */
 static uint32_t duration_ms(uint32_t frames)
 {
-    if (g_duration_bad || !g_out_rate || !frames) return 0;
+    if (g_use_pcm_length || g_duration_bad || !g_out_rate || !frames) return 0;
 
     uint32_t num = frames * 1000u;          /* 28224000 — no overflow */
     if (num % g_out_rate) return 0;         /* would not round-trip */
@@ -284,7 +297,7 @@ static void desc_build(slot_t *s)
     *(volatile uint32_t *)(d + SFX_OFF_BUF_B)    = (uint32_t)(uintptr_t)s->pcm;
     *(volatile uint32_t *)(d + SFX_OFF_BUF_LEN)  = s->frames * 4u;
     d[SFX_OFF_TYPE] = SFX_TYPE_LPCM;
-    *(volatile uint32_t *)(d + SFX_OFF_RATE)     = DEVICE_RATE;
+    *(volatile uint32_t *)(d + SFX_OFF_RATE)     = g_source_rate;
     *(volatile uint32_t *)(d + SFX_OFF_CHANNELS) = 2;
     *(volatile uint32_t *)(d + SFX_OFF_BITS)     = 16;
     *(volatile uint32_t *)(d + SFX_OFF_TRIM_LO)  = 0;
@@ -316,28 +329,39 @@ static bool desc_playing(const slot_t *s)
    and the tick notices an empty chain and restarts. */
 static void desc_chain(slot_t *s, slot_t *next)
 {
-    *(volatile uint32_t *)(s->desc + SFX_OFF_NEXT) =
-        next ? (uint32_t)(uintptr_t)next->desc : 0u;
+    __atomic_store_n((uint32_t *)(s->desc + SFX_OFF_NEXT),
+                     next ? (uint32_t)(uintptr_t)next->desc : 0u,
+                     __ATOMIC_RELEASE);
 }
 
 /* ---- buffers ------------------------------------------------------------- */
 
-static bool reserve(int16_t **pcm, uint32_t bytes)
+static bool reserve(slot_t *slot, uint32_t frames)
 {
-    if (*pcm) return true;
+    if (slot->pcm && slot->capacity >= frames) return true;
+    uint32_t bytes = frames * 4u;
     /* Refuse rather than risk the OS allocator, which panics and reboots the
        device on failure. Starting a preset must never be able to do that. */
-    if (hb_os_heap_largest() < bytes + (128u * 1024u)) return false;
-    *pcm = (int16_t *)hb_os_alloc(bytes);
-    return *pcm != (int16_t *)0;
+    if (desc_playing(slot) || hb_os_heap_largest() < bytes + (128u * 1024u))
+        return false;
+    int16_t *pcm = hb_os_alloc(bytes);
+    if (!pcm) return false;
+    hb_os_free(slot->pcm);
+    slot->pcm = pcm;
+    slot->capacity = frames;
+    return true;
 }
 
-static bool buffers_ready(void)
+static bool reserve_stream_buffers(uint32_t block_frames)
 {
     for (int i = 0; i < SLOTS; i++)
-        if (!reserve(&g_slot[i].pcm, BLOCK_FRAMES * 4u)) return false;
+        if (!reserve(&g_slot[i], block_frames)) return false;
+    return reserve(&g_quiet, QUIET_FRAMES);
+}
 
-    if (!reserve(&g_quiet.pcm, QUIET_FRAMES * 4u)) return false;
+static bool buffers_ready(uint32_t block_frames)
+{
+    if (!reserve_stream_buffers(block_frames)) return false;
     for (uint32_t i = 0; i < QUIET_FRAMES * 2u; i++) g_quiet.pcm[i] = 0;
     g_quiet.frames = QUIET_FRAMES;
     return true;
@@ -350,7 +374,7 @@ static bool buffers_ready(void)
  * Straight through now: the block is a fixed number of frames and the chain
  * joins sample-exactly, so there is nothing to choose about where it ends and
  * nothing has to be rendered twice. */
-static bool build_step(int idx)
+static bool build_step(int idx, uint32_t target_frames)
 {
     slot_t *b = &g_slot[idx];
     if (b->state == SLOT_READY) return true;
@@ -358,11 +382,19 @@ static bool build_step(int idx)
 
     b->state = SLOT_BUILD;
 
-    uint32_t want = BLOCK_FRAMES - b->fill;
+    uint32_t want = target_frames - b->fill;
     if (want > CHUNK_FRAMES) want = CHUNK_FRAMES;
 
     uint32_t got = s_pull(b->pcm + (uint32_t)b->fill * 2u, want, want,
                           s_pull_ctx);
+    s_waiting_for_input = got == EN_AUDIO_PULL_WAIT;
+    if (s_waiting_for_input) return false;
+    if (got > want) {
+        hb_trace_log("AudPull", got, want);
+        s_pull = NULL;
+        g_state = EN_AUDIO_FAILED;
+        return false;
+    }
     if (got == 0) {
         /* The program ended part-way through. Whatever is already rendered is
            real audio and gets played at its true length — duration_ms() will
@@ -376,9 +408,9 @@ static bool build_step(int idx)
     }
 
     b->fill += got;
-    if (b->fill < BLOCK_FRAMES) return false;
+    if (b->fill < target_frames) return false;
 
-    b->frames = BLOCK_FRAMES;
+    b->frames = target_frames;
     b->fill = 0;
     b->state = SLOT_READY;
     return true;
@@ -387,12 +419,15 @@ static bool build_step(int idx)
 /* Build a whole block now, hitch and all. Only for the moment the user presses
    play, where there is no lead time to spread the work over and a few tens of
    milliseconds is the difference between starting and not. */
-static bool build_now(int idx)
+static bool build_now(int idx, uint32_t target_frames)
 {
     g_slot[idx].fill = 0;
     g_slot[idx].state = SLOT_FREE;
-    for (int guard = 0; guard < 64; guard++)
-        if (build_step(idx)) return true;
+    for (int guard = 0; guard < 64; guard++) {
+        uint32_t fill = g_slot[idx].fill;
+        if (build_step(idx, target_frames)) return true;
+        if (g_slot[idx].fill == fill) return false;
+    }
     return false;
 }
 
@@ -413,7 +448,7 @@ static void fade_in_head(slot_t *b)
 static void enqueue(int idx)
 {
     g_slot[idx].state = SLOT_QUEUED;
-    g_slot[idx].seen_playing = false;
+    g_slot[idx].seen_playing = desc_playing(&g_slot[idx]);
     g_q[g_qn++] = (uint8_t)idx;
     /* Deliberately not counted towards elapsed here. Handing a block to the OS
        is not the same as playing it, and counting it here made the clock jump a
@@ -425,7 +460,7 @@ static void enqueue(int idx)
 static bool play_slot(int idx)
 {
     slot_t *b = &g_slot[idx];
-    if (b->state != SLOT_READY || !b->pcm || !b->frames) return false;
+    if (b->state != SLOT_READY || !b->pcm || !b->frames || desc_playing(b)) return false;
 
     if (g_fade_in) { fade_in_head(b); g_fade_in = false; }
     desc_build(b);
@@ -434,6 +469,7 @@ static bool play_slot(int idx)
     if (!player) return false;
     ((sfx_player_play_t)SFX_PLAYER_PLAY_ADDR)(player, b->desc,
                                               (void *)0, (void *)0);
+    if (!desc_playing(b)) return false;
 
     /* Only now does a voice exist to read the mixer rate from, so the
        descriptor just handed over went out with a zero duration - the safe
@@ -462,7 +498,7 @@ static bool play_slot(int idx)
 static bool chain_slot(int idx)
 {
     slot_t *b = &g_slot[idx];
-    if (b->state != SLOT_READY || !g_qn) return false;
+    if (b->state != SLOT_READY || !g_qn || desc_playing(b)) return false;
 
     if (g_fade_in) { fade_in_head(b); g_fade_in = false; }
     desc_build(b);
@@ -475,7 +511,8 @@ static bool chain_slot(int idx)
    so it is an estimate — every use of it keeps SAFETY_FRAMES clear. */
 static uint32_t play_cursor(void)
 {
-    return MS_FRAMES(hb_time_uptime_ms() - g_head_start_ms);
+    uint32_t elapsed = hb_time_uptime_ms() - g_head_start_ms;
+    return ((uint64_t)g_source_rate * elapsed) / 1000u;
 }
 
 /* Break the chain and fade the sounding block to zero in place, ahead of the
@@ -521,39 +558,61 @@ static void silence_now(void)
    rather than a cold start — and it costs no rendering at all. */
 static void arm_quiet(void)
 {
-    if (g_quiet_armed && desc_playing(&g_quiet)) return;
+    if (g_quiet_armed || desc_playing(&g_quiet)) return;
 
+    void *player = ((sfx_player_inst_t)SFX_PLAYER_INST_ADDR)();
+    if (!player) return;
     desc_build(&g_quiet);
     desc_chain(&g_quiet, &g_quiet);
-
-    if (g_qn) {
-        /* Hand over from whatever is still sounding rather than starting a
-           second voice on top of it: the pool mixes, it does not replace. */
-        desc_chain(&g_slot[g_q[g_qn - 1]], &g_quiet);
-    } else {
-        void *player = ((sfx_player_inst_t)SFX_PLAYER_INST_ADDR)();
-        if (!player) return;
-        ((sfx_player_play_t)SFX_PLAYER_PLAY_ADDR)(player, g_quiet.desc,
-                                                  (void *)0, (void *)0);
-    }
-    g_quiet_armed = true;
+    ((sfx_player_play_t)SFX_PLAYER_PLAY_ADDR)(player, g_quiet.desc, NULL, NULL);
+    g_quiet_armed = desc_playing(&g_quiet);
 }
 
 static void release_quiet(void)
 {
-    if (!g_quiet_armed) return;
     desc_chain(&g_quiet, (slot_t *)0);   /* let it run out */
     g_quiet_armed = false;
 }
 
 static void drop_queue(void)
 {
+    bool detached = g_qn != 0;
+    if (g_qn && !g_quiet_armed)
+        desc_chain(&g_quiet, NULL);
     for (uint8_t i = 0; i < g_qn; i++) {
         slot_t *b = &g_slot[g_q[i]];
+        desc_chain(b, NULL);
         b->state = SLOT_FREE;
         b->fill = 0;
     }
     g_qn = 0;
+    for (unsigned i = 0; i < SLOTS; i++)
+        detached |= g_slot[i].state == SLOT_RETIRED;
+    if (detached && !g_detached) {
+        g_detached = true;
+        g_detached_ms = hb_time_uptime_ms();
+    }
+}
+
+/* A mixer pass can already have fetched the next pointer when we unlink it.
+   Keep descriptors and their PCM intact until that handoff has settled. */
+static bool detached_audio_busy(void)
+{
+    if (!g_detached) return false;
+    uint32_t now = hb_time_uptime_ms();
+    for (unsigned i = 0; i < SLOTS; i++) {
+        if (desc_playing(&g_slot[i])) {
+            g_detached_ms = now;
+            return true;
+        }
+    }
+    if (now - g_detached_ms < DETACH_SETTLE_MS)
+        return true;
+    g_detached = false;
+    for (unsigned i = 0; i < SLOTS; i++)
+        if (g_slot[i].state == SLOT_RETIRED)
+            g_slot[i].state = SLOT_FREE;
+    return false;
 }
 
 /* ---- the interface ------------------------------------------------------- */
@@ -563,11 +622,9 @@ static int prepare_unload(void)
     g_stopping = true;
     s_pull = (en_audio_pull_fn)0;
     silence_now();
-    for (unsigned i = 0; i < SLOTS; i++) desc_chain(&g_slot[i], NULL);
-    desc_chain(&g_quiet, NULL);
-    int busy = desc_playing(&g_quiet);
-    for (unsigned i = 0; i < SLOTS; i++) busy |= desc_playing(&g_slot[i]);
-    if (busy) return 0;
+    drop_queue();
+    release_quiet();
+    if (detached_audio_busy() || desc_playing(&g_quiet)) return 0;
     for (unsigned i = 0; i < SLOTS; i++) {
         hb_os_free(g_slot[i].pcm);
         g_slot[i].pcm = NULL;
@@ -601,37 +658,45 @@ bool en_audio_can_stream(void) { return true; }
 
 uint32_t en_audio_preferred_rate(void) { return DEVICE_RATE; }
 
-bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
-                           void *ctx)
+typedef enum { RENDERED_AUDIO, WAV_AUDIO, LIVE_AUDIO, VIDEO_AUDIO } stream_kind_t;
+
+static stream_kind_t g_stream_kind;
+static bool g_start_pending;
+
+static bool start_voice(void)
 {
-    (void)sample_rate;             /* the descriptor is told DEVICE_RATE */
-    if (!pull) return false;
-    if (!buffers_ready()) { g_state = EN_AUDIO_FAILED; return false; }
-
-    /* Whatever is queued belongs to the old source. Fade it out where it stands
-       and take the blocks back: letting it run would sum with the new audio,
-       since the pool mixes and nothing can cut a sounding voice short. */
-    silence_now();
-    drop_queue();
-
-    s_pull = pull;
-    s_pull_ctx = ctx;
-    s_source_done = false;
-    g_frames_done = 0;
-    g_paused = false;
-    g_stopping = false;
-    g_fade_in = true;
-
+    g_start_pending = false;
+    if (!buffers_ready(g_block_frames)) {
+        hb_trace_log("AudAlloc", g_block_frames, hb_os_heap_largest());
+        s_pull = NULL;
+        g_state = EN_AUDIO_FAILED;
+        return false;
+    }
     for (int i = 0; i < SLOTS; i++) {
         g_slot[i].state = SLOT_FREE;
         g_slot[i].fill = 0;
     }
 
-    if (!build_now(0)) { g_state = EN_AUDIO_FAILED; return false; }
+    /* Keep the opening in one buffer across several mixer passes. For file
+       playback, leave the duration hint at zero so it follows PCM exhaustion
+       even if the output route is still changing its rate. */
+    uint32_t opening_frames = g_block_frames;
+    if (g_stream_kind == WAV_AUDIO && reserve(&g_slot[0], FILE_OPENING_FRAMES))
+        opening_frames = FILE_OPENING_FRAMES;
+    unsigned ready = build_now(0, opening_frames) ? 1u : 0u;
+    while ((g_stream_kind == WAV_AUDIO || g_stream_kind == VIDEO_AUDIO) &&
+           ready && ready < SLOTS && s_pull && !s_source_done &&
+           build_now(ready, g_block_frames))
+        ready++;
+    if (!ready || !s_pull) {
+        s_pull = NULL;
+        g_state = EN_AUDIO_FAILED;
+        return false;
+    }
 
     /* Silence is chainable, so hand over from it rather than starting a second
        voice underneath it. */
-    if (g_quiet_armed) {
+    if (g_quiet_armed && desc_playing(&g_quiet)) {
         if (g_fade_in) { fade_in_head(&g_slot[0]); g_fade_in = false; }
         desc_build(&g_slot[0]);
         desc_chain(&g_quiet, &g_slot[0]);
@@ -639,11 +704,112 @@ bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
         g_head_start_ms = hb_time_uptime_ms();
         g_quiet_armed = false;
         g_state = EN_AUDIO_PLAYING;
-        return true;
+    } else {
+        release_quiet();
+        if (!play_slot(0)) {
+            hb_trace_log("AudStart", g_stream_kind, g_slot[0].frames);
+            s_pull = NULL;
+            g_state = EN_AUDIO_FAILED;
+            return false;
+        }
     }
 
-    if (!play_slot(0)) { g_state = EN_AUDIO_FAILED; return false; }
+    for (unsigned i = 1; i < ready; i++)
+        chain_slot(i);
+    /* Measure from this stream's start. Using the previous tick here can
+       mark the new chain as starved before its first poll. */
+    g_last_tick_ms = hb_time_uptime_ms();
     return true;
+}
+
+static bool start_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx, stream_kind_t kind)
+{
+    if (!pull || (rate != DEVICE_RATE && rate != 44100u)) return false;
+    silence_now();
+    drop_queue();
+    s_pull = pull;
+    s_pull_ctx = ctx;
+    s_source_done = false;
+    s_waiting_for_input = false;
+    g_refilling = false;
+    g_frames_done = 0;
+    g_paused = false;
+    g_stream_pause = false;
+    g_stopping = false;
+    g_fade_in = true;
+    g_source_rate = rate;
+    g_block_frames = kind == VIDEO_AUDIO ? rate / 10u : BLOCK_FRAMES;
+    g_short_video_blocks = kind == VIDEO_AUDIO;
+    g_use_pcm_length = kind != RENDERED_AUDIO;
+    g_stream_kind = kind;
+    g_start_pending = detached_audio_busy();
+    if (g_start_pending) {
+        g_state = EN_AUDIO_PLAYING;
+        return true;
+    }
+    return start_voice();
+}
+
+bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
+                           void *ctx)
+{
+    (void)sample_rate;             /* the descriptor is told DEVICE_RATE */
+    return start_stream(DEVICE_RATE, pull, ctx, RENDERED_AUDIO);
+}
+
+bool en_audio_start_buffered_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx)
+{
+    return start_stream(rate, pull, ctx, WAV_AUDIO);
+}
+
+bool en_audio_start_live_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx)
+{
+    return start_stream(rate, pull, ctx, LIVE_AUDIO);
+}
+
+bool en_audio_reserve_video_buffers(void)
+{
+    /* Cover the largest 100 ms video block before allocating decoder frames. */
+    return reserve_stream_buffers(44100u / 10u);
+}
+
+bool en_audio_start_video_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx)
+{
+    return start_stream(rate, pull, ctx, VIDEO_AUDIO);
+}
+
+bool en_audio_stream_buffering(void)
+{
+    return g_state == EN_AUDIO_PLAYING && (g_refilling || !g_qn);
+}
+
+void en_audio_queue_status(unsigned *queued, unsigned *playing_mask)
+{
+    *queued = g_qn;
+    *playing_mask = 0;
+    for (unsigned i = 0; i < SLOTS; i++)
+        if (desc_playing(&g_slot[i]))
+            *playing_mask |= 1u << i;
+}
+
+void en_audio_tick_with_refill(bool refill_ready)
+{
+    uint32_t now = hb_time_uptime_ms();
+    if (!g_refilling && !g_paused && !g_qn && s_waiting_for_input && s_pull) {
+        hb_trace_log("AudWait", (uint32_t)g_frames_done, g_block_frames);
+        g_refilling = true;
+        g_refill_started = now;
+    }
+    if (g_refilling) {
+        uint32_t min_wait = g_short_video_blocks ? 750u : 3500u;
+        if (g_paused || now - g_refill_started < min_wait || !refill_ready) {
+            g_last_tick_ms = now;
+            return;
+        }
+        g_refilling = false;
+        g_fade_in = true;
+    }
+    en_audio_tick();
 }
 
 /* The file-shaped half of the interface is unreachable: the engine checks
@@ -689,10 +855,25 @@ void en_audio_set_paused(bool paused)
            then silence is chained to itself so the DAC never goes down. */
         silence_now();
         drop_queue();
-        arm_quiet();
+        if (!detached_audio_busy())
+            arm_quiet();
         g_state = EN_AUDIO_PAUSED;
     } else {
         g_fade_in = true;          /* come back up, do not step */
+        g_state = EN_AUDIO_PLAYING;
+    }
+}
+
+void en_audio_set_stream_paused(bool paused)
+{
+    if (paused == g_paused || !s_pull)
+        return;
+    g_paused = paused;
+    g_stream_pause = paused;
+    if (paused) {
+        g_state = EN_AUDIO_PAUSED;
+    } else {
+        g_fade_in = true;
         g_state = EN_AUDIO_PLAYING;
     }
 }
@@ -707,6 +888,22 @@ void en_audio_set_volume(int percent)
 
 int en_audio_get_volume(void) { return g_volume; }
 
+/* A decode can occupy the UI long enough for every short block to play
+ * between polls. Check the whole chain before giving up on an unseen block. */
+static bool chain_drained(uint32_t elapsed)
+{
+    if (!g_qn)
+        return false;
+    uint32_t frames = 0;
+    for (uint8_t i = 0; i < g_qn; i++) {
+        const slot_t *slot = &g_slot[g_q[i]];
+        if (desc_playing(slot))
+            return false;
+        frames += slot->frames;
+    }
+    return elapsed >= (frames * 1000u + g_source_rate - 1u) / g_source_rate + 100u;
+}
+
 void en_audio_tick(void)
 {
     if (!s_pull) return;
@@ -714,15 +911,14 @@ void en_audio_tick(void)
     uint32_t now = hb_time_uptime_ms();
     uint32_t since = now - g_last_tick_ms;
     g_last_tick_ms = now;
-
-    /* Starved: the frame callback stopped being run, which is what happens when
-       RetailOS brings its own Music app to the front. Everything queued has
-       long since played out unheard, so start clean rather than carrying on
-       from stale state. */
-    if (g_qn && since > STARVED_MS) {
-        drop_queue();
-        g_fade_in = true;
+    if (detached_audio_busy()) return;
+    if (g_start_pending && !g_stopping && !g_paused) {
+        start_voice();
+        return;
     }
+
+    if (g_qn && since > STARVED_MS)
+        hb_trace_log("AudGap", since, g_qn);
 
     /* Reclaim. The chain is strictly FIFO — blocks finish in the order they
        were linked — so only the front of the queue can be the one to retire.
@@ -730,10 +926,17 @@ void en_audio_tick(void)
        descriptor up, cleared by the completion handler when the buffer has been
        played out. Waiting to see it set first is what distinguishes a block
        that has finished from one that has not started. */
+    bool drained = (g_short_video_blocks || since > STARVED_MS) &&
+                   chain_drained(now - g_head_start_ms);
     while (g_qn) {
         slot_t *h = &g_slot[g_q[0]];
         if (desc_playing(h)) { h->seen_playing = true; break; }
-        if (!h->seen_playing) break;      /* queued, not reached yet */
+        /* A later block sounding proves the mixer moved off this descriptor,
+           even if no UI tick saw this block take ownership. */
+        bool successor_playing = false;
+        for (uint8_t i = 1; i < g_qn; i++)
+            successor_playing |= desc_playing(&g_slot[g_q[i]]);
+        if (!h->seen_playing && !successor_playing && !drained) break;
 
         /* How long the block took against how long its audio actually is.
          *
@@ -748,7 +951,7 @@ void en_audio_tick(void)
          * is what played correctly before any of this - much the better of the
          * two failures to land on. */
         if (!g_duration_bad && duration_ms(h->frames)) {
-            uint32_t expect = (h->frames * 1000u) / DEVICE_RATE;
+            uint32_t expect = (h->frames * 1000u) / g_source_rate;
             uint32_t took = now - g_head_start_ms;
             if (h->seen_playing && took > expect + expect / 2u) {
                 if (++g_overrun >= 2) g_duration_bad = true;
@@ -757,7 +960,8 @@ void en_audio_tick(void)
             }
         }
 
-        h->state = SLOT_FREE;
+        h->state = successor_playing ? SLOT_FREE : SLOT_RETIRED;
+        h->retired_ms = now;
         h->fill = 0;
         g_frames_done += h->frames;       /* this one really has played */
         for (uint8_t i = 1; i < g_qn; i++) g_q[i - 1] = g_q[i];
@@ -765,7 +969,11 @@ void en_audio_tick(void)
         g_head_start_ms = now;
     }
 
-    if (g_paused) { arm_quiet(); return; }
+    if (g_paused) {
+        if (!g_stream_pause)
+            arm_quiet();
+        return;
+    }
 
     if (g_stopping) {
         if (!g_qn) {
@@ -782,9 +990,13 @@ void en_audio_tick(void)
        single frame carries enough of the rendering to be seen. */
     int ready = -1;
     for (int i = 0; i < SLOTS; i++) {
-        if (g_slot[i].state == SLOT_READY) { ready = i; break; }
-        if (g_slot[i].state == SLOT_FREE || g_slot[i].state == SLOT_BUILD) {
-            if (build_step(i)) ready = i;
+        slot_t *slot = &g_slot[i];
+        if (slot->state == SLOT_RETIRED && now - slot->retired_ms >= DETACH_SETTLE_MS &&
+            !desc_playing(slot))
+            slot->state = SLOT_FREE;
+        if (slot->state == SLOT_READY) { ready = i; break; }
+        if (slot->state == SLOT_FREE || slot->state == SLOT_BUILD) {
+            if (build_step(i, g_block_frames)) ready = i;
             break;                        /* one slice per tick, no more */
         }
     }
@@ -797,7 +1009,11 @@ void en_audio_tick(void)
                A fresh voice has to be started, and that join is covered by the
                fade-in rather than by anything clever. */
             release_quiet();
-            play_slot(ready);
+            if (!play_slot(ready)) {
+                hb_trace_log("AudRetry", (uint32_t)g_frames_done, g_slot[ready].frames);
+                s_pull = NULL;
+                g_state = EN_AUDIO_FAILED;
+            }
         }
         return;
     }
@@ -820,10 +1036,10 @@ double en_audio_elapsed(void)
 
     if (g_qn) {
         uint32_t cap = g_slot[g_q[0]].frames;
-        uint32_t in = MS_FRAMES(hb_time_uptime_ms() - g_head_start_ms);
+        uint32_t in = play_cursor();
         f += (in > cap) ? cap : in;
     }
-    return (double)f / (double)DEVICE_RATE;
+    return (double)f / (double)g_source_rate;
 }
 
 const char *en_audio_backend_name(void) { return "RetailOS sfx, chained PCM"; }

@@ -29,6 +29,11 @@ void hb_lv_set_frame_cb(void (*cb)(void));
  * ON TOP of LVGL (e.g. a hardware overlay via hb_compositor). Pass 0 to clear. */
 void hb_lv_set_post_cb(void (*cb)(void));
 
+#ifdef HB_LV_LANDSCAPE
+/* Switch the display and touch axes together. */
+void hb_lv_set_landscape(int enabled);
+#endif
+
 /* The display framebuffer (LVGL renders directly into it; XRGB8888, w*h*4,
  * GPU-addressable). For an app frame cb that wants hardware 2D (hb_compositor). */
 void *hb_lv_framebuffer(void);

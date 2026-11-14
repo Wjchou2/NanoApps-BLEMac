@@ -212,6 +212,19 @@ uint32_t hb_fs_size_at(const char *path, int volume);
 /* hb_fs_read on the disk volume in <= 256 KB read calls (for large images). */
 uint32_t hb_fs_read_chunked(const char *path, void *buf, uint32_t max_size);
 
+/* Sequential reader with its own object and cache. One reader can remain
+   open across UI ticks while other filesystem operations run. */
+bool hb_fs_reader_open(const char *path);
+uint32_t hb_fs_reader_read(void *buf, uint32_t size);
+void hb_fs_reader_close(void);
+
+#if defined(HB_H264) || defined(NANO_VIDEO_STREAM)
+/* Keeps the compressed clip open while the primary reader reads decoded frames. */
+bool hb_fs_media_reader_open(const char *path);
+uint32_t hb_fs_media_reader_read(void *buf, uint32_t size);
+void hb_fs_media_reader_close(void);
+#endif
+
 /* Directory iteration. Opaque storage; pass the same hb_dir_t through
    open / next / close. Caller owns the buffer.
 
@@ -468,18 +481,18 @@ void hb_accel_read_milli_g(int32_t out_xyz[3]);
 
    DRAM survives N7G's kernel-panic + reboot cycle. The resident owns a
    ring inside its heap-loaded image; apps' hb_trace_log forwards there
-   (via hb_shared). On the next boot the resident finds the previous
-   ring by scanning DRAM and saves it to /Library/lasttrace.bin.
+   (via hb_shared). On the next boot the resident searches DRAM for the
+   previous ring and exposes a copy through the boot report, or saves it
+   to /Library/lasttrace.bin on devices without the boot report.
 
    Usage (any image):
      hb_trace_log("BOOT",   0,  0);    // breadcrumb at any point
      hb_trace_log("OP_NEW", buf_addr, size);
      // if we crash anywhere here, the trace tells us where */
 #define HB_TRACE_BYTES   (16u + 16u * 256u)   /* header + 256 entries        */
-/* The ring always lives in the OS heap (0x08d184b8 up to ~11 MB below the top
-   of RAM, where the reserved pools start), so only that range is searched. */
+/* The resident can be allocated anywhere in this OS heap window. */
 #define HB_TRACE_SCAN_LO 0x08D00000u
-#define HB_TRACE_SCAN_HI 0x09600000u
+#define HB_TRACE_SCAN_HI 0x0A000000u
 void hb_trace_init(void);
 void hb_trace_reset(void);
 void hb_trace_log(const char *tag, uint32_t v1, uint32_t v2);

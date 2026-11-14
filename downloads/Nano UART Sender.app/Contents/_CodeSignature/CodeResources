@@ -3,9 +3,22 @@
 <plist version="1.0">
 <dict>
 	<key>files</key>
-	<dict/>
+	<dict>
+		<key>Resources/NanoSender.icns</key>
+		<data>
+		PEiEsvHYkf4uEE0j3gRS4jhzeBU=
+		</data>
+	</dict>
 	<key>files2</key>
-	<dict/>
+	<dict>
+		<key>Resources/NanoSender.icns</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			/MKCOk6z9y1YkxjGTaYVBy6vHJd1d4B+lVj0uPIluqs=
+			</data>
+		</dict>
+	</dict>
 	<key>rules</key>
 	<dict>
 		<key>^Resources/</key>

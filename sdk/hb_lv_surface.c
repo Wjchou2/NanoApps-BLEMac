@@ -38,6 +38,24 @@ static uint32_t tick_cb(void)
  * when s_draw == s_fb it's an in-place alpha-fixup. */
 static unsigned int *s_draw;   /* LVGL draw buffer base (GPU pixel buffer pixels or s_fb) */
 
+#ifdef HB_LV_LANDSCAPE
+static uint32_t s_landscape_strip[432u * 16u] __attribute__((aligned(32)));
+
+static void landscape_flush(lv_display_t *d, const lv_area_t *area, unsigned char *px)
+{
+    uint32_t *target = lv_display_get_user_data(d);
+    const uint32_t *source = (const uint32_t *)px;
+    int width = lv_display_get_original_horizontal_resolution(d);
+    int columns = area->x2 - area->x1 + 1;
+    for (int x = area->x1; x <= area->x2; x++) {
+        uint32_t *row = target + x * width;
+        for (int y = area->y1; y <= area->y2; y++)
+            row[width - 1 - y] = source[(y - area->y1) * columns + x - area->x1] | 0xff000000u;
+    }
+    lv_display_flush_ready(d);
+}
+#endif
+
 /* ---- flush (DIRECT mode) ---- */
 static void flush_cb(lv_display_t *d, const lv_area_t *area, unsigned char *px)
 {
@@ -53,6 +71,25 @@ static void flush_cb(lv_display_t *d, const lv_area_t *area, unsigned char *px)
     }
     lv_display_flush_ready(d);
 }
+
+#ifdef HB_LV_LANDSCAPE
+void hb_lv_set_landscape(int enabled)
+{
+    if (enabled) {
+        lv_display_set_rotation(s_disp, LV_DISPLAY_ROTATION_270);
+        lv_display_set_buffers(s_disp, s_landscape_strip, NULL, sizeof(s_landscape_strip),
+                               LV_DISPLAY_RENDER_MODE_PARTIAL);
+        lv_display_set_flush_cb(s_disp, landscape_flush);
+    } else {
+        int w = lv_display_get_original_horizontal_resolution(s_disp);
+        int h = lv_display_get_original_vertical_resolution(s_disp);
+        lv_display_set_rotation(s_disp, LV_DISPLAY_ROTATION_0);
+        lv_display_set_buffers(s_disp, s_draw, NULL, (unsigned int)(w * h * 4),
+                               LV_DISPLAY_RENDER_MODE_DIRECT);
+        lv_display_set_flush_cb(s_disp, flush_cb);
+    }
+}
+#endif
 
 /* ---- touch ---- map the shared surface touch source onto LVGL's indev. */
 static void indev_read_cb(lv_indev_t *indev, lv_indev_data_t *data)

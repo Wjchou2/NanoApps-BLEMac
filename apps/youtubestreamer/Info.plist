@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key> <string>org.nanoapps.youtubestreamer</string>
+    <key>CFBundleName</key> <string>YouTube Streamer</string>
+    <key>CFBundleExecutable</key> <string>youtubestreamer</string>
+    <key>HBAppKind</key> <integer>1</integer>
+    <key>HBIconGlyph</key> <string>film</string>
+    <key>HBIconColor</key> <string>#c94046</string>
+</dict>
+</plist>

@@ -107,6 +107,23 @@ bool en_audio_can_stream(void);
 bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
                            void *ctx);
 
+/* Device backend. Fill the available PCM slots before starting the voice.
+   Intended for disk playback where occasional reads can stall a UI tick. */
+bool en_audio_start_buffered_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx);
+
+/* Device backend. The source may return EN_AUDIO_PULL_WAIT when it has no
+   samples yet. Zero still marks end of stream. */
+#define EN_AUDIO_PULL_WAIT UINT32_MAX
+bool en_audio_start_live_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx);
+/* Device backend. Start with shorter PCM blocks for a small video frame queue. */
+bool en_audio_reserve_video_buffers(void);
+bool en_audio_start_video_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx);
+bool en_audio_stream_buffering(void);
+/* Device diagnostics. Bit i of playing_mask is the firmware flag for slot i. */
+void en_audio_queue_status(unsigned *queued, unsigned *playing_mask);
+/* Device backend only. On underrun, wait for a refill before pulling again. */
+void en_audio_tick_with_refill(bool refill_ready);
+
 /* The rate this backend would rather be fed. The DSP is rate-agnostic, so this
    is about what the output path likes and what the CPU can afford, not about
    the maths. */
@@ -117,6 +134,8 @@ uint32_t en_audio_preferred_rate(void);
 void en_audio_stop(uint32_t fade_ms);
 
 void en_audio_set_paused(bool paused);
+/* Device streaming pause lets the queued PCM finish and preserves unread samples. */
+void en_audio_set_stream_paused(bool paused);
 
 /* 0..100. The app caps this well below maximum by default — long sessions at
    high SPL are the real hazard with this kind of audio. */

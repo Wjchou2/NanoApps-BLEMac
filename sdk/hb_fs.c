@@ -230,6 +230,52 @@ uint32_t hb_fs_read_chunked(const char *path, void *buf, uint32_t max_size)
     return total;
 }
 
+typedef struct {
+    uint8_t obj[FOBJ_ONESHOT_SIZE] __attribute__((aligned(8)));
+    uint8_t cache[FOBJ_CACHE_BYTES] __attribute__((aligned(32)));
+    bool live;
+} fs_reader_t;
+
+static fs_reader_t primary_reader;
+
+static bool reader_open(fs_reader_t *reader, const char *path)
+{
+    if (reader->live)
+        return false;
+    fobj_t file;
+    reader->live = fobj_begin(&file, reader->obj, reader->cache, path, false, FS_MAIN_VOLUME);
+    return reader->live;
+}
+
+static uint32_t reader_read(fs_reader_t *reader, void *buf, uint32_t size)
+{
+    if (!reader->live || !size || size > FS_WRITE_CHUNK)
+        return 0;
+    uint64_t got = 0;
+    return FOBJ_READ(reader->obj, size, buf, (uint32_t *)&got) == 0 && got <= size
+        ? (uint32_t)got : 0;
+}
+
+static void reader_close(fs_reader_t *reader)
+{
+    if (reader->live) {
+        FOBJ_CLOSE(reader->obj);
+        reader->live = false;
+    }
+}
+
+bool hb_fs_reader_open(const char *path) { return reader_open(&primary_reader, path); }
+uint32_t hb_fs_reader_read(void *buf, uint32_t size) { return reader_read(&primary_reader, buf, size); }
+void hb_fs_reader_close(void) { reader_close(&primary_reader); }
+
+#if defined(HB_H264) || defined(NANO_VIDEO_STREAM)
+static fs_reader_t media_reader;
+
+bool hb_fs_media_reader_open(const char *path) { return reader_open(&media_reader, path); }
+uint32_t hb_fs_media_reader_read(void *buf, uint32_t size) { return reader_read(&media_reader, buf, size); }
+void hb_fs_media_reader_close(void) { reader_close(&media_reader); }
+#endif
+
 /* ----- directory iteration -----
  *
  * Directory iteration and path helper entry points.

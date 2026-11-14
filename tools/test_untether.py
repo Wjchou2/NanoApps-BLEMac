@@ -526,11 +526,21 @@ class ResidentTests(unittest.TestCase):
         bogus = bytearray(make_ring(seq=99, count=300))
         struct.pack_into("<I", bogus, 4, 7)
         m = ChainMachine(real_resident=True,
-                         prev_rings=((0x09120000, newest), (0x08F00010, older),
+                         prev_rings=((0x09840000, newest), (0x08F00010, older),
                                      (0x09300000, bytes(bogus))))
         m.arm(); m.dispatch()
         self.assertEqual(m.written_files["/Library/lasttrace.bin"], newest)
         self.assertEqual(m.word(m.res_addr("s_prev_ring")), 0)
+
+    def test_previous_ring_is_published_through_boot_report(self):
+        trace = make_ring(seq=9, count=64)
+        m = ChainMachine(real_resident=True, prev_rings=((0x09840000, trace),))
+        m.word(REPORT_BASE + 0x2c, 0x32505452)
+        m.arm(); m.dispatch()
+        address = m.word(REPORT_BASE + 0x170)
+        self.assertEqual(address, m.res_addr("s_prev_ring"))
+        self.assertEqual(bytes(m.uc.mem_read(address, len(trace))), trace)
+        self.assertNotIn("/Library/lasttrace.bin", m.written_files)
 
     def test_pack_is_registered_with_heap_state(self):
         m = ChainMachine(real_resident=True)

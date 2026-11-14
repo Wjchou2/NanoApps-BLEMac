@@ -36,6 +36,8 @@ SDK_SRCS := \
     $(SDK_DIR)/hb_ui.c \
     $(SDK_DIR)/hb_kb.c \
     $(SDK_DIR)/hb_audio.c \
+    $(SDK_DIR)/hb_pcm.c \
+    $(SDK_DIR)/hb_wav.c \
     $(SDK_DIR)/hb_paged_list.c \
     $(SDK_DIR)/hb_brightness.c \
     $(SDK_DIR)/hb_rtc.c \
@@ -69,6 +71,59 @@ SDK_SRCS := \
 # including this file so their layout does not depend on host linker GC.
 ifneq ($(strip $(SDK_SRCS_ONLY)),)
   SDK_SRCS := $(SDK_SRCS_ONLY)
+endif
+
+# Optional firmware-backed Bluetooth and hardware video modules.
+ifneq ($(strip $(HB_BLE)$(HB_CLASSIC)$(filter 1,$(HB_H264))),)
+  ifneq ($(LV_SURFACE),1)
+    $(error Bluetooth and H.264 modules require LV_SURFACE := 1)
+  endif
+endif
+ifneq ($(strip $(HB_BLE)),)
+  SDK_SRCS += $(SDK_DIR)/hb_ble.c
+  ifeq ($(HB_BLE),uart)
+    SDK_SRCS += $(SDK_DIR)/hb_ble_audio.c
+    EXTRA_CFLAGS += -DHB_BLE_UART
+  else ifneq ($(HB_BLE),scan)
+    $(error HB_BLE must be scan or uart)
+  endif
+endif
+ifneq ($(strip $(HB_CLASSIC)),)
+  SDK_SRCS += $(SDK_DIR)/hb_classic.c $(SDK_DIR)/hb_classic_pair_capture.S
+  ifeq ($(HB_CLASSIC),inbox)
+    SDK_SRCS += $(SDK_DIR)/hb_classic_inbox.c
+  else ifeq ($(HB_CLASSIC),raw)
+    EXTRA_CFLAGS += -DHB_CLASSIC_RAW
+  else ifneq ($(filter $(HB_CLASSIC),audio video youtube_audio youtube_video),)
+    EXTRA_CFLAGS += -DNANO_STREAM
+    ifneq ($(filter $(HB_CLASSIC),video youtube_video),)
+      EXTRA_CFLAGS += -DNANO_VIDEO_STREAM
+      HB_H264 := 1
+    endif
+    ifeq ($(HB_CLASSIC),youtube_video)
+      EXTRA_CFLAGS += -DNANO_YOUTUBE_VIDEO
+    endif
+    ifneq ($(filter $(HB_CLASSIC),youtube_audio youtube_video),)
+      EXTRA_CFLAGS += -DNANO_YOUTUBE_SEARCH -DHB_LV_LANDSCAPE
+    endif
+    ifeq ($(HB_CLASSIC),youtube_audio)
+      EXTRA_CFLAGS += -DNANO_YOUTUBE_AUDIO
+    endif
+  else
+    $(error Unknown HB_CLASSIC profile: $(HB_CLASSIC))
+  endif
+endif
+ifeq ($(HB_H264),1)
+  SDK_SRCS += $(SDK_DIR)/hb_h264.c $(SDK_DIR)/hb_video_surface.c
+  EXTRA_CFLAGS += -DHB_H264
+endif
+ifeq ($(HB_VIDEO_LAYER),1)
+  SDK_SRCS += $(SDK_DIR)/hb_video_layer.c
+  EXTRA_CFLAGS += -DHB_VIDEO_LAYER
+endif
+ifneq ($(filter 1,$(HB_H264))$(filter audio youtube_audio,$(HB_CLASSIC)),)
+  SDK_SRCS += $(REPO_DIR)/apps/entrain/platform/audio_device.c
+  SDK_EXTRA_DEPS += $(REPO_DIR)/apps/entrain/platform/audio.h
 endif
 
 CC      := arm-none-eabi-gcc
@@ -293,7 +348,7 @@ $(BUILD)/$(APP_NAME).bin: $(BUILD)/$(APP_NAME).elf
 
 # Relocatable surface blob: link base-0 (-Wl,-q keeps relocations), then
 # mkrelocapp flattens the image + emits the ABS32 reloc table as a .hbapp.
-$(BUILD)/$(APP_NAME).reloc.elf: $(SRCS) $(SDK_SRCS) $(LDLIBS_LVGL) $(wildcard $(SDK_DIR)/*.h) $(wildcard *.h) $(REPO_DIR)/tools/check_no_thumb_fp.py | $(BUILD)
+$(BUILD)/$(APP_NAME).reloc.elf: $(SRCS) $(SDK_SRCS) $(SDK_EXTRA_DEPS) $(LDLIBS_LVGL) $(wildcard $(SDK_DIR)/*.h) $(wildcard *.h) $(REPO_DIR)/tools/check_no_thumb_fp.py | $(BUILD)
 	$(CC) $(CFLAGS) $(RELOC_LDFLAGS) -o $@ $(SRCS) $(SDK_SRCS) $(LDLIBS_LVGL) $(LDLIBS)
 	@if [ "$(CHECK_NO_THUMB_FP)" = "1" ]; then \
 		$(PYTHON) $(REPO_DIR)/tools/check_no_thumb_fp.py \

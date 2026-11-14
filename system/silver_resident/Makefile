@@ -7,4 +7,7 @@ APP_NAME := silver_resident
 SRCS     := silver_resident.c bluetooth_fix.c dock_fix.c ../../sdk/hb_app_catalog.c
 RELOC    := 1
 EXTRA_CFLAGS += -DHB_RAWMSG_TRACE
+ifeq ($(DISPLAY_PROBE),1)
+EXTRA_CFLAGS += -DHB_DISPLAY_PROBE=1
+endif
 include ../../sdk/hb_app.mk

@@ -1319,8 +1319,10 @@ def cmd_trace(args, tr):
     report = tr.peek(0x086c9b84, 512)
     if struct.unpack_from("<I", report, 0x2c)[0] != 0x32505452:
         raise SystemExit("The current heap resident has not published a boot report")
-    address = struct.unpack_from("<I", report, 0x150)[0]
-    if not 0x08d00000 <= address < 0x0a000000 - 4112:
+    address = struct.unpack_from("<I", report, 0x170 if args.previous else 0x150)[0]
+    if not 0x08d00000 <= address <= 0x0a000000 - 4112 or address % 16:
+        if args.previous:
+            raise SystemExit("No previous boot trace was published")
         raise SystemExit("The current resident has not published a trace ring")
     data = tr.peek(address, 4112)
     if len(data) < 16:
@@ -1636,6 +1638,7 @@ def main():
     sp.add_argument("--output", type=Path, help="ZIP destination (default: build/packages/APP.zip)")
     sp = sub.add_parser("peek");   sp.add_argument("addr"); sp.add_argument("n", nargs="?", default="0x200")
     sp = sub.add_parser("trace");  sp.add_argument("n", nargs="?", type=int, default=48)
+    sp.add_argument("--previous", action="store_true", help="read the trace recovered from the preceding boot")
     sub.add_parser("eject")
     sub.add_parser("reboot")
     sub.add_parser("remount")

@@ -13,6 +13,7 @@ typedef struct {
     ble_audio_state_t state;
     uint32_t received;
     uint32_t total;
+    bool play_on_receive;
 } ble_audio_progress_t;
 
 /* Call under the Bluetooth broker lock, except for playback and cleanup. */
@@ -22,7 +23,7 @@ void ble_audio_reset(void);
 
 /* A ready clip stays immutable until playback has been started on the UI task. */
 bool ble_audio_play(void);
-bool ble_audio_playing(void);
-bool ble_audio_release(void);
+bool ble_audio_reserve_stream(void);
+uint32_t ble_audio_prepare_stream(void);
 
 #endif

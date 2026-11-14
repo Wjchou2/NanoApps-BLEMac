@@ -120,8 +120,8 @@ static uint8_t s_hooks_patched;   /* firmware function patches applied (action_h
 /* The trace ring lives in our .bss and is published through the C6/98 boot
  * report for host reads. On the next boot, entry can also find
  * the PREVIOUS boot's ring by scanning DRAM (DRAM survives a panic reboot),
- * copy it here, and let action_hook write the copy to disk — one write per boot,
- * never on the UI event path. Decode with tools/decode_lasttrace.py. */
+ * copy it here, and publish it through the boot report. Devices without that
+ * report use a one-time disk write from action_hook. */
 #define LASTTRACE_PATH  "/Library/lasttrace.bin"
 static uint32_t s_trace_ring[HB_TRACE_BYTES / 4u] __attribute__((aligned(16)));
 static uint32_t s_prev_ring[HB_TRACE_BYTES / 4u] __attribute__((aligned(16)));
@@ -272,12 +272,87 @@ typedef void  (*void_self_t)(void *self);
 static void hb_rec_timer_arm(void);   /* defined below (with the capture timer)     */
 #endif
 
+#ifdef HB_DISPLAY_PROBE
+/* Sample the display before the stock player loses the screen. */
+static void capture_display_windows(void)
+{
+    enum { SAMPLE_BYTES = 4096, ENABLE = 0x04, VIDEO_ACTIVE = 8, PLANE_A = 0x11c, PLANE_B = 0x120 };
+    static const uint32_t offsets[] = {
+        0x00, ENABLE, 0x10, 0x14,
+        0x20, 0x24, 0x28, 0x2c, 0x30, 0x34,
+        0x40, 0x44, 0x48, 0x4c, 0x50, 0x54,
+        0x60, 0x64, 0x68, 0x6c,
+        0x118, PLANE_A, PLANE_B, 0x124, 0x128, 0x130, 0x134, 0x138, 0x13c,
+        0x2c0, 0x2c4, 0x2e0, 0x2e4,
+    };
+    static unsigned next_capture;
+    static struct {
+        uint32_t magic, uptime, registers, sample_bytes;
+        uint32_t reg[sizeof(offsets) / sizeof(offsets[0])][2];
+        uint32_t plane[2][SAMPLE_BYTES / sizeof(uint32_t)];
+    } capture;
+    const volatile uint32_t *lcd = (const volatile uint32_t *)0x38900000u;
+    capture.magic = 0x3244434cu; /* LCD2 */
+    capture.uptime = hb_time_uptime_ms();
+    capture.registers = sizeof(offsets) / sizeof(offsets[0]);
+    capture.sample_bytes = 0;
+    uint32_t enabled = 0, a = 0, b = 0;
+    for (unsigned i = 0; i < capture.registers; i++) {
+        uint32_t offset = offsets[i];
+        uint32_t value = lcd[offset / 4u];
+        capture.reg[i][0] = offset;
+        capture.reg[i][1] = value;
+        if (offset == ENABLE)
+            enabled = value;
+        else if (offset == PLANE_A)
+            a = value;
+        else if (offset == PLANE_B)
+            b = value;
+    }
+
+    /* Only follow distinct, aligned SDRAM addresses from an active video
+       window. If the display flips during the read, keep just the registers. */
+    if ((enabled & VIDEO_ACTIVE) && !((a | b) & 3u) &&
+        a >= 0x08000000u && a <= 0x0c000000u - SAMPLE_BYTES &&
+        b >= 0x08000000u && b <= 0x0c000000u - SAMPLE_BYTES &&
+        (a < b ? b - a : a - b) >= SAMPLE_BYTES) {
+        const volatile uint32_t *first = (const volatile uint32_t *)(uintptr_t)(a | 0x80000000u);
+        const volatile uint32_t *second = (const volatile uint32_t *)(uintptr_t)(b | 0x80000000u);
+        for (unsigned i = 0; i < SAMPLE_BYTES / sizeof(uint32_t); i++) {
+            capture.plane[0][i] = first[i];
+            capture.plane[1][i] = second[i];
+        }
+        if ((lcd[ENABLE / 4u] & VIDEO_ACTIVE) && a == lcd[PLANE_A / 4u] && b == lcd[PLANE_B / 4u])
+            capture.sample_bytes = SAMPLE_BYTES;
+    }
+
+    char path[] = "/Data/video-layer-00.bin";
+    if (!hb_fs_is_dir("/Data") && !hb_fs_mkdir("/Data"))
+        return;
+    while (next_capture < 100u) {
+        unsigned number = next_capture++;
+        path[sizeof("/Data/video-layer-") - 1u] = '0' + number / 10u;
+        path[sizeof("/Data/video-layer-")] = '0' + number % 10u;
+        if (!hb_fs_exists(path)) {
+            uint32_t size = sizeof(capture) - sizeof(capture.plane) + 2u * capture.sample_bytes;
+            hb_fs_write(path, &capture, size);
+            return;
+        }
+    }
+}
+#endif
+
 __attribute__((section(".text.hook"), used, noinline))
 static void hb_home_triple_hook(void *self)
 {
     uint8_t mode = s_shared.screenshot_mode;  /* 0 off,1 shot,2 rec */
     if (mode == 1u) {
+#ifdef HB_DISPLAY_PROBE
+        (void)self;
+        capture_display_windows();
+#else
         ((void_self_t)(A_SCREENSHOT_KEY | 1u))(self);   /* /screenshotNNNN.bmp */
+#endif
         return;
     }
 #if HB_REC_INTERCEPT
@@ -1640,6 +1715,7 @@ void payload_entry(void *image_base, uint32_t image_span, uint32_t resident_vers
     }
     hb_trace_attach(s_trace_ring, seq + 1u);
     hb_boot_report(0x150u, (uint32_t)(uintptr_t)s_trace_ring);
+    hb_boot_report(0x170u, s_prev_found ? (uint32_t)(uintptr_t)s_prev_ring : 0);
     hb_trace_log("RESENTRY", (uint32_t)(uintptr_t)&payload_entry, seq + 1u);
     hb_trace_log("PREVRING", (uint32_t)(uintptr_t)prev, seq);
     hb_silver_rawmsg_trace = hb_trace_log;
