@@ -50,7 +50,7 @@ Run these commands from the repo root.
 `package` creates a standalone ZIP in `build/packages/`. `install` with explicit targets deploys only those apps and can guide a first-time firmware setup. `--resident-only` updates the runtime while preserving the installed app catalog. To take a local app out of future **Install all apps** runs, move its folder outside `apps/`. A leftover `build/<name>.hbapp` can still be found by the packager. To uninstall an app from the device, remove its `.nanoapp` folder from the Nano’s `Apps/` directory and eject.
 
 Build the Mac executable with Swift on macOS if you are changing the companion app. Its bundle name and executable are specified in the [app’s Info.plist](downloads/Nano%20Bluetooth%20Link.app/Contents/Info.plist).
-
+<b>For rpi tethering refer to [https://github.com/Wjchou2/RpiBluetooth](https://github.com/Wjchou2/RpiBluetooth) </b>
 ```sh
 swiftc -O -o /tmp/NanoBluetoothLink \
   tools/macos/nano_bluetooth_link.swift \
