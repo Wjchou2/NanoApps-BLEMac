@@ -133,6 +133,7 @@ def load_meta(app, i):
         meta["label"]     = d.get("CFBundleName", meta["label"])[:23]
         meta["kind"]      = int(d.get("HBAppKind", meta["kind"]))
         meta["minimum_resident"] = int(d.get("HBMinimumResidentVersion", 0))
+        meta["icon_fit_stock"] = d.get("HBIconFitStock", False)
         meta["glyph"]     = d.get("HBIconGlyph", meta["glyph"])
         meta["color"]     = hex_rgb(d.get("HBIconColor", ""), fb_color)
     return meta
@@ -318,7 +319,20 @@ def main(apps, out=None):
         if art.exists():
             make_png(None, metas[i]["color"], dst, art=Image.open(art).convert("RGBA"))
         elif custom.exists():
-            Image.open(custom).convert("RGBA").resize((SIZE, SIZE), Image.LANCZOS).save(dst)
+            icon = Image.open(custom).convert("RGBA")
+            if metas[i].get("icon_fit_stock"):
+                # Fit the visible artwork into the stock disc's footprint.
+                bounds = icon.getchannel("A").getbbox()
+                if bounds:
+                    icon = icon.crop(bounds)
+                icon.thumbnail((CIRC_W, CIRC_H), Image.LANCZOS)
+                tile = Image.new("RGBA", (SIZE, SIZE))
+                tile.alpha_composite(icon, (CIRC_X0 + (CIRC_W - icon.width) // 2,
+                                            CIRC_Y0 + (CIRC_H - icon.height) // 2))
+                icon = tile
+            else:
+                icon = icon.resize((SIZE, SIZE), Image.LANCZOS)
+            icon.save(dst)
         else:
             make_png(metas[i]["glyph"], metas[i]["color"], dst)
     icondb = scratch / "icons.bin"

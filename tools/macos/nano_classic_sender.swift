@@ -32,23 +32,16 @@ private struct ClassicDeviceChoice: Identifiable {
     var title: String { name.map { "\($0) (\(address))" } ?? address }
 }
 
-private enum ClassicDestination: String, CaseIterable {
-    case bluetoothTest = "Bluetooth Test"
-    case stream = "Stream"
-    case youtubeAudio = "YouTube Audio"
-    case youtubeStreamer = "YouTube Streamer"
-    case videoStream = "VideoStream"
+enum ClassicDestination: String {
+    case youtubeAudio = "YT Music"
+    case youtubeStreamer = "YT Video"
 
-    var sendsVideo: Bool { self == .videoStream || self == .youtubeStreamer }
-    var searchesYouTube: Bool { self == .youtubeAudio || self == .youtubeStreamer }
+    var sendsVideo: Bool { self == .youtubeStreamer }
 
     var psm: BluetoothL2CAPPSM {
         switch self {
-        case .bluetoothTest: 0x1003
-        case .stream: 0x1005
         case .youtubeAudio: 0x1009
         case .youtubeStreamer: 0x100B
-        case .videoStream: 0x1007
         }
     }
 }
@@ -429,10 +422,8 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
     private var sent = 0
     private var percentSent = 0
     private var headerSent = false
-    private var destination = ClassicDestination.bluetoothTest
-    private var bytesPerSecond = 0
+    private var destination = ClassicDestination.youtubeAudio
     private var transferCover: Data?
-    private var nextLivePacket: TimeInterval = 0
     private var audioTransferToken: UInt32 = 0
     private var liveAudioBytesPerSecond = 0
     private var audioSendPaused = false
@@ -576,9 +567,7 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
 
         stopDiscovery()
         self.destination = destination
-        let listenInstruction = destination != .bluetoothTest
-            ? "Open \(destination.rawValue) on the nano"
-            : "Tap Listen Classic in \(destination.rawValue) on the nano"
+        let listenInstruction = "Open \(destination.rawValue) on the nano"
         if device.isPaired() {
             if pairOnly {
                 remember(device)
@@ -755,35 +744,24 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
         return "\(label) \(reason) at \(percentSent)% · \(audioBytes) audio bytes · \(pacedAudioPackets) packets · \(elapsed)s."
     }
 
-    func send(_ result: Result<URL, Error>, quality: ClassicQuality, videoPlayback: VideoPlayback,
-              convertDuringTransfer: Bool, videoQuality: HardwareVideo.Quality, frameRate: HardwareVideo.FrameRate,
-              videoAudioQuality: ClassicQuality) {
-        guard canSend, let channel else { return }
-        let mtu = Int(channel.outgoingMTU)
-        if mtu > 0 && mtu < Self.headerSize {
-            status = "The Classic channel reports a packet limit of \(mtu) bytes. File headers need \(Self.headerSize)."
-            return
-        }
+    func sendAudioFile(_ result: Result<URL, Error>, quality: ClassicQuality, playback: VideoPlayback) {
+        guard canSend, let channel, destination == .youtubeAudio else { return }
         do {
             let url = try result.get()
-            if destination == .videoStream {
-                prepareVideo(url, playback: videoPlayback, quality: videoQuality,
-                             frameRate: frameRate, audioQuality: videoAudioQuality,
-                             convertDuringTransfer: convertDuringTransfer, channel: channel)
-            } else {
-                let bytes = try ClassicAudio.wav(from: url, quality: quality)
-                sendPayload(bytes, from: url, extension: ".wav", rate: quality.bytesPerSecond, channel: channel)
-            }
+            prepareStreamAudio(quality: quality, playback: playback, channel: channel) { _ in url }
         } catch {
             status = error.localizedDescription
         }
     }
 
-    func sendStreamAudio(_ source: Result<URL, Error>, quality: ClassicQuality, playback: VideoPlayback) {
-        guard canSend, let channel else { return }
+    func sendVideoFile(_ result: Result<URL, Error>, playback: VideoPlayback,
+                       quality: HardwareVideo.Quality, frameRate: HardwareVideo.FrameRate,
+                       audioQuality: ClassicQuality, convertDuringTransfer: Bool) {
+        guard canSend, let channel, destination == .youtubeStreamer else { return }
         do {
-            let url = try source.get()
-            prepareStreamAudio(quality: quality, playback: playback, channel: channel) { _ in url }
+            let url = try result.get()
+            prepareVideo(url, playback: playback, quality: quality, frameRate: frameRate,
+                         audioQuality: audioQuality, convertDuringTransfer: convertDuringTransfer, channel: channel)
         } catch {
             status = error.localizedDescription
         }
@@ -829,7 +807,7 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
             pump(currentChannel)
             return
         }
-        if destination.searchesYouTube, data == Data("NYH1".utf8) {
+        if data == Data("NYH1".utf8) {
             supportsResultArtwork = true
             return
         }
@@ -882,7 +860,6 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
                 return
             }
         }
-        guard destination.searchesYouTube else { return }
         if destination == .youtubeStreamer, data == Data("NYV1".utf8) {
             youtubeVideoReady = true
             if file == nil && !isConvertingVideo {
@@ -913,12 +890,6 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
                              channel: currentChannel, selectionID: id)
                 return
             }
-            if youtubeAudioPlayback == .whileSending &&
-                (youtubeAudioProtocol < 3 || (youtubeSearchQuality.sampleRate == 44_100 && youtubeAudioProtocol < 4)) {
-                status = "Install the updated YouTube Audio app for While Sending."
-                sendSearchStatus(status, channel: currentChannel)
-                return
-            }
             prepareStreamAudio(quality: youtubeSearchQuality, playback: youtubeAudioPlayback,
                                channel: currentChannel, downloading: true, track: song) { folder in
                 self.sendSearchStatus("Downloading selected song...", channel: currentChannel, accepted: true)
@@ -941,7 +912,7 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
 
     func searchYouTube(_ input: String) {
         let query = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard canSend, let channel, destination.searchesYouTube, !query.isEmpty else { return }
+        guard canSend, let channel, !query.isEmpty else { return }
         let video = destination == .youtubeStreamer
         canSend = false
         audioProgress = nil
@@ -1080,9 +1051,9 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
     }
 
     func sendYouTubeAudio(_ input: String, quality: ClassicQuality, playback: VideoPlayback) {
-        guard canSend, let channel else { return }
+        guard canSend, let channel, destination == .youtubeAudio else { return }
         prepareStreamAudio(quality: quality, playback: playback, channel: channel, downloading: true) {
-            try await YouTubeAudio.download(input, into: $0)
+            try await YouTubeAudio.download(input, into: $0, artwork: true)
         }
     }
 
@@ -1090,11 +1061,17 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
                                     channel: IOBluetoothL2CAPChannel, downloading: Bool = false,
                                     track: YouTubeAudio.Song? = nil,
                                     source: @escaping (URL) async throws -> URL) {
+        if playback == .whileSending &&
+            (youtubeAudioProtocol < 3 || (quality.sampleRate == 44_100 && youtubeAudioProtocol < 4)) {
+            status = "Install the updated YT Music app for While Sending."
+            sendSearchStatus(status, channel: channel)
+            return
+        }
         canSend = false
         isPreparingAudio = true
         audioProgress = nil
-        let live = track != nil && playback == .whileSending
-        let adpcm = track != nil && youtubeTrackUsesADPCM(quality, playback: playback)
+        let live = playback == .whileSending
+        let adpcm = youtubeTrackUsesADPCM(quality, playback: playback)
         status = downloading ? "Downloading YouTube audio…" : "Preparing audio for the nano…"
         videoTask = Task { @MainActor [weak self, weak channel] in
             guard let self, let channel else { return }
@@ -1109,17 +1086,15 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
             do {
                 try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
                 let url = try await source(folder)
+                let hasFileAccess = url.startAccessingSecurityScopedResource()
+                defer { if hasFileAccess { url.stopAccessingSecurityScopedResource() } }
                 self.status = "Preparing audio for the nano…"
                 let conversion = Task.detached(priority: .userInitiated) {
-                    let wav = try track != nil
-                        ? await YouTubeAudio.trackWAV(from: url, in: folder, quality: quality, adpcm: adpcm)
-                        : ClassicAudio.wav(from: url, quality: quality)
+                    let wav = try await YouTubeAudio.trackWAV(from: url, in: folder, quality: quality, adpcm: adpcm)
                     var cover: Data?
-                    if let track {
-                        cover = YouTubeAudio.coverPixels(in: folder)
-                        if cover == nil {
-                            cover = await YouTubeAudio.resultArtwork(track, video: false, side: 160)
-                        }
+                    if downloading { cover = YouTubeAudio.coverPixels(in: folder) }
+                    if cover == nil, let track {
+                        cover = await YouTubeAudio.resultArtwork(track, video: false, side: 160)
                     }
                     let checksum = try Self.payloadChecksum(wav)
                     return (wav, cover, checksum)
@@ -1135,7 +1110,7 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
                     try await Task.sleep(for: .milliseconds(10))
                 }
                 guard self.channel === channel else { return }
-                self.sendStreamAudio(bytes, from: url, quality: quality, playback: playback,
+                self.sendStreamAudio(bytes, from: url, playback: playback,
                                      channel: channel, cover: cover, checksum: checksum,
                                      liveAudioRate: live ? YouTubeAudio.encodedBytesPerSecond(quality: quality, adpcm: adpcm) : 0)
             } catch {
@@ -1150,8 +1125,7 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
         }
     }
 
-    private func sendStreamAudio(_ bytes: Data, from url: URL, quality: ClassicQuality,
-                                 playback: VideoPlayback, channel: IOBluetoothL2CAPChannel, cover: Data?,
+    private func sendStreamAudio(_ bytes: Data, from url: URL, playback: VideoPlayback, channel: IOBluetoothL2CAPChannel, cover: Data?,
                                  checksum: UInt32, liveAudioRate: Int) {
         let suffix: String
         switch playback {
@@ -1160,7 +1134,6 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
         case .receiveTest: suffix = ".ntx"
         }
         sendPayload(bytes, from: url, extension: suffix,
-                    rate: playback == .whileSending ? quality.bytesPerSecond : 0,
                     channel: channel, cover: cover, checksum: checksum, liveAudioRate: liveAudioRate)
     }
 
@@ -1189,7 +1162,6 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
         progressiveVideo = true
         isConvertingVideo = true
         headerSent = false
-        bytesPerSecond = 0
         videoBytesSent = 0
         videoCreditLimit = 0
         videoCreditWaitSince = nil
@@ -1244,6 +1216,8 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
                 } else {
                     throw YouTubeAudio.DownloadError(message: "Choose a video to send.")
                 }
+                let hasFileAccess = url.startAccessingSecurityScopedResource()
+                defer { if hasFileAccess { url.stopAccessingSecurityScopedResource() } }
                 try Task.checkCancellation()
                 guard self.channel === channel else { return }
                 preparation = .encoding
@@ -1417,7 +1391,7 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
         return hash
     }
 
-    private func sendPayload(_ bytes: Data, from url: URL, extension suffix: String, rate: Int,
+    private func sendPayload(_ bytes: Data, from url: URL, extension suffix: String,
                              channel: IOBluetoothL2CAPChannel,
                              cover: Data? = nil, checksum: UInt32? = nil, liveAudioRate: Int = 0) {
         let checksum = checksum ?? bytes.reduce(UInt32(2_166_136_261)) { ($0 ^ UInt32($1)) &* 16_777_619 }
@@ -1453,12 +1427,10 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
         retryCount = 0
         percentSent = 0
         headerSent = false
-        bytesPerSecond = rate
-        nextLivePacket = 0
         canSend = false
         status = "Sending \(url.lastPathComponent)…"
         videoProgress = destination.sendsVideo ? 0 : nil
-        audioProgress = (destination == .stream || destination == .youtubeAudio) ? 0 : nil
+        audioProgress = 0
         let result = enqueue(header, payloadBytes: 0, to: channel)
         if result != kIOReturnSuccess {
             failWrite(result)
@@ -1528,7 +1500,6 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
             self.file = nil
             transferCover = nil
             switch destination {
-            case .bluetoothTest: status = "Audio sent. Open Audio Player once the nano says it saved."
             case .youtubeAudio:
                 audioProgress = 100
                 canSend = true
@@ -1539,10 +1510,7 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
                 } else {
                     status = "Audio sent. Search again on the nano when playback ends."
                 }
-            case .stream:
-                audioProgress = 100
-                status = "Audio sent. Leave Stream open to finish playback."
-            case .youtubeStreamer, .videoStream:
+            case .youtubeStreamer:
                 break
             }
             return
@@ -1550,7 +1518,7 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
         let percent = sent * 100 / total
         if percent != percentSent {
             percentSent = percent
-            if destination == .stream || destination == .youtubeAudio { audioProgress = percent }
+            audioProgress = percent
             if !audioSendPaused {
                 let label = testingAudioReceive ? "Receive Test (Mac paced)" :
                     (liveAudioBytesPerSecond > 0 ? "Streaming audio" :
@@ -1566,7 +1534,6 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
         pumping = true
         defer { pumping = false }
 
-        let paced = destination == .stream && bytesPerSecond > 0
         let mtu = Int(channel.outgoingMTU)
         let packetSize = mtu > 0 ? mtu : Self.headerSize
         let cover = progressiveVideo ? nil : transferCover
@@ -1583,11 +1550,13 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
                     Self.pacedStereoBytesPerSecond : Self.pacedAudioBytesPerSecond
                 let bytesPerSecond = liveAudioBytesPerSecond > 0
                     ? min(Double(cap), Double(liveAudioBytesPerSecond) * 1.05) : Double(cap)
-                let sentTime = Double(start - artworkBytes) / bytesPerSecond
-                // Limit catch-up after the Mac stalls to 20 ms of audio data.
-                let epoch = max(pacedAudioEpoch ?? now, now - sentTime - 0.02)
-                pacedAudioEpoch = epoch
-                let deadline = epoch + Double(end - artworkBytes) / bytesPerSecond
+                let packetTime = Double(end - start) / bytesPerSecond
+                let endTime = Double(end - artworkBytes) / bytesPerSecond
+                // Allow at least one packet to catch up. Otherwise a packet
+                // longer than the 20 ms window is postponed on every retry.
+                let catchUp = max(0, 0.02 - packetTime)
+                let deadline = max((pacedAudioEpoch ?? now) + endTime, now - catchUp)
+                pacedAudioEpoch = deadline - endTime
                 if deadline > now {
                     schedulePump(channel, after: deadline - now)
                     return
@@ -1615,18 +1584,6 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
                     status = "Sending video to the nano…"
                 }
             }
-            if paced && end > artworkBytes + 3 * bytesPerSecond {
-                let now = ProcessInfo.processInfo.systemUptime
-                let interval = Double(end - start) / Double(bytesPerSecond)
-                let deadline = max(nextLivePacket, now - 0.25) + interval
-                if deadline > now {
-                    nextLivePacket = deadline - interval
-                    schedulePump(channel, after: deadline - now)
-                    return
-                }
-                nextLivePacket = deadline
-            }
-
             submitted = end
             let packet: Data
             if let cover, start < artworkBytes {
@@ -1664,22 +1621,13 @@ private final class ClassicSender: NSObject, ObservableObject, IOBluetoothDevice
     }
 }
 
-struct ClassicFilesView: View {
+struct ClassicMediaView: View {
     let discoveryHint: String
-    var streamOnly = false
-    var youtubeOnly = false
-    var youtubeVideoOnly = false
+    let destination: ClassicDestination
     @StateObject private var sender = ClassicSender()
     @State private var choosing = false
     @State private var showingDeviceSetup = false
     @State private var quality = ClassicQuality.low
-    @AppStorage("classic.destination") private var classicDestination = ClassicDestination.bluetoothTest
-    private var destination: ClassicDestination {
-        if youtubeVideoOnly { return .youtubeStreamer }
-        if youtubeOnly { return .youtubeAudio }
-        return streamOnly ? .stream : classicDestination
-    }
-    @AppStorage("classic.streamPlayback") private var streamPlayback = VideoPlayback.whileSending
     @AppStorage("classic.youtubeAudioPlayback") private var youtubeAudioPlayback = VideoPlayback.whileSending
     @State private var youtubeLink = ""
     @State private var youtubeQuery = ""
@@ -1711,17 +1659,6 @@ struct ClassicFilesView: View {
             Text(sender.status)
                 .font(.callout)
                 .foregroundStyle(.secondary)
-            if !streamOnly && !youtubeOnly && !youtubeVideoOnly {
-                Picker("Nano app", selection: $classicDestination) {
-                    ForEach(ClassicDestination.allCases.filter { $0 == .bluetoothTest || $0 == .videoStream }, id: \.self) { app in
-                        Text(app.rawValue).tag(app)
-                    }
-                }
-                .disabled(sender.connectedOrOpening)
-                .onAppear {
-                    if classicDestination == .stream { classicDestination = .bluetoothTest }
-                }
-            }
             HStack {
                 if sender.isPairing {
                     Button("Stop Waiting") { sender.stop() }
@@ -1731,63 +1668,27 @@ struct ClassicFilesView: View {
                     Button("Connect") { sender.connect(address: nanoAddress, pairOnly: false, destination: destination) }
                         .disabled(nanoAddress.isEmpty)
                 }
-                if !youtubeOnly && !youtubeVideoOnly {
-                    Button(destination == .videoStream ? "Send Video…" : "Send Audio…") { choosing = true }
-                        .disabled(!sender.canSend)
-                }
             }
-            if youtubeOnly || youtubeVideoOnly {
-                HStack {
-                    TextField(youtubeVideoOnly ? "Search YouTube" : "Search YouTube Music", text: $youtubeQuery)
-                        .textFieldStyle(.roundedBorder)
-                        .focused($youtubeSearchFocused)
-                        .onSubmit(submitYouTubeSearch)
-                    Button("Search", action: submitYouTubeSearch)
-                        .disabled(!sender.canSend || youtubeQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-                Text(youtubeVideoOnly ? "Search here or on the nano, then pick a video on the nano." :
-                     "Search here or on the nano, then pick a song on the nano.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if youtubeOnly {
-                    Picker("Start playback", selection: $youtubeAudioPlayback) {
-                        ForEach(VideoPlayback.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                    }
-                    .pickerStyle(.menu)
-                }
-                if let progress = sender.audioProgress {
-                    ProgressView(value: Double(progress), total: 100)
-                } else if sender.isPreparingAudio {
-                    ProgressView().controlSize(.small)
-                }
+            HStack {
+                TextField(destination.sendsVideo ? "Search YouTube" : "Search YouTube Music", text: $youtubeQuery)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($youtubeSearchFocused)
+                    .onSubmit(submitYouTubeSearch)
+                Button("Search", action: submitYouTubeSearch)
+                    .disabled(!sender.canSend || youtubeQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-            if streamOnly {
-                HStack {
-                    TextField("YouTube video link", text: $youtubeLink)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit { if sender.canSend { sender.sendYouTubeAudio(youtubeLink, quality: quality, playback: streamPlayback) } }
-                    Button("Send Link") {
-                        sender.sendYouTubeAudio(youtubeLink, quality: quality, playback: streamPlayback)
-                    }
+            Text(destination.sendsVideo ? "Search here or on the nano, then pick a video on the nano." :
+                 "Search here or on the nano, then pick a song on the nano.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack {
+                TextField("YouTube link", text: $youtubeLink)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(sendLink)
+                Button("Send Link", action: sendLink)
                     .disabled(!sender.canSend || youtubeLink.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-                Picker("Start playback", selection: $streamPlayback) {
-                    ForEach(VideoPlayback.playbackOptions, id: \.self) { Text($0.rawValue).tag($0) }
-                }
-                if let progress = sender.audioProgress {
-                    ProgressView(value: Double(progress), total: 100)
-                } else if sender.isPreparingAudio {
-                    ProgressView().controlSize(.small)
-                }
-            }
-            if youtubeVideoOnly {
-                HStack {
-                    TextField("YouTube video link", text: $youtubeLink)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit(sendVideoLink)
-                    Button("Send Link", action: sendVideoLink)
-                        .disabled(!sender.canSend || youtubeLink.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
+                Button("Send File…") { choosing = true }
+                    .disabled(!sender.canSend)
             }
             if destination.sendsVideo {
                 Picker("Start playback", selection: $videoPlayback) {
@@ -1849,6 +1750,10 @@ struct ClassicFilesView: View {
                     }
                 }
             } else {
+                Picker("Start playback", selection: $youtubeAudioPlayback) {
+                    ForEach(VideoPlayback.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.menu)
                 Picker("Audio quality", selection: $quality) {
                     ForEach(ClassicQuality.allCases, id: \.self) { option in
                         Text(option.label).tag(option)
@@ -1856,15 +1761,17 @@ struct ClassicFilesView: View {
                 }
                 .pickerStyle(.menu)
                 .onChange(of: quality, initial: true) { _, value in sender.youtubeSearchQuality = value }
-                let adpcm = youtubeOnly && sender.youtubeTrackUsesADPCM(quality, playback: youtubeAudioPlayback)
-                let bytesPerSecond = youtubeOnly ?
-                    YouTubeAudio.encodedBytesPerSecond(quality: quality, adpcm: adpcm) : quality.bytesPerSecond
-                let size = Double(bytesPerSecond) * 60 / 1_000_000
-                let sizeLabel = String(format: "%.2f MB per minute", size)
-                Text(adpcm ? "ADPCM · \(sizeLabel)" :
-                     (youtubeOnly ? sizeLabel : "\(sizeLabel) · WAV, MP3, M4A or AIFF up to 5 minutes"))
+                let adpcm = sender.youtubeTrackUsesADPCM(quality, playback: youtubeAudioPlayback)
+                let bytesPerSecond = YouTubeAudio.encodedBytesPerSecond(quality: quality, adpcm: adpcm)
+                let sizeLabel = String(format: "%.2f MB per minute", Double(bytesPerSecond) * 60 / 1_000_000)
+                Text(adpcm ? "ADPCM · \(sizeLabel)" : sizeLabel)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let progress = sender.audioProgress {
+                    ProgressView(value: Double(progress), total: 100)
+                } else if sender.isPreparingAudio {
+                    ProgressView().controlSize(.small)
+                }
             }
         }
         .onChange(of: youtubeAudioPlayback, initial: true) { _, value in sender.youtubeAudioPlayback = value }
@@ -1874,29 +1781,34 @@ struct ClassicFilesView: View {
         .onChange(of: videoAudioQuality, initial: true) { _, value in sender.youtubeVideoAudioQuality = value }
         .onChange(of: convertDuringTransfer, initial: true) { _, value in sender.youtubeConvertDuringTransfer = value }
         .onChange(of: sender.canSend) { _, ready in
-            if ready && (youtubeOnly || youtubeVideoOnly) && youtubeQuery.isEmpty {
+            if ready && youtubeQuery.isEmpty {
                 youtubeSearchFocused = true
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(22)
-        .fileImporter(isPresented: $choosing, allowedContentTypes: destination == .videoStream
-                      ? HardwareVideo.fileTypes : ClassicAudio.fileTypes) {
-            if streamOnly {
-                sender.sendStreamAudio($0, quality: quality, playback: streamPlayback)
-                return
+        .fileImporter(isPresented: $choosing, allowedContentTypes: destination.sendsVideo
+                      ? HardwareVideo.fileTypes : [.audio]) { result in
+            if destination.sendsVideo {
+                sender.sendVideoFile(result, playback: videoPlayback, quality: videoQuality,
+                                     frameRate: frameRate, audioQuality: videoAudioQuality,
+                                     convertDuringTransfer: convertDuringTransfer)
+            } else {
+                sender.sendAudioFile(result, quality: quality, playback: youtubeAudioPlayback)
             }
-            sender.send($0, quality: quality, videoPlayback: videoPlayback,
-                        convertDuringTransfer: convertDuringTransfer, videoQuality: videoQuality, frameRate: frameRate, videoAudioQuality: videoAudioQuality)
         }
     }
 
-    private func sendVideoLink() {
+    private func sendLink() {
         let link = youtubeLink.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !link.isEmpty else { return }
-        sender.sendYouTubeVideo(link, playback: videoPlayback, quality: videoQuality,
-                               frameRate: frameRate, audioQuality: videoAudioQuality,
-                               convertDuringTransfer: convertDuringTransfer)
+        if destination.sendsVideo {
+            sender.sendYouTubeVideo(link, playback: videoPlayback, quality: videoQuality,
+                                   frameRate: frameRate, audioQuality: videoAudioQuality,
+                                   convertDuringTransfer: convertDuringTransfer)
+        } else {
+            sender.sendYouTubeAudio(link, quality: quality, playback: youtubeAudioPlayback)
+        }
     }
 
     private func submitYouTubeSearch() {

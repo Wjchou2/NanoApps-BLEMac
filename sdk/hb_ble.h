@@ -31,12 +31,18 @@ typedef struct {
 } hb_ble_update_t;
 
 /* Connects to the scanned address and starts Nordic UART discovery. Use
- * hb_ble_connect for Nano UART Sender text/audio or connect_notifications
+ * hb_ble_connect for Nano Bluetooth Link text/audio or connect_notifications
  * to receive binary TX notifications as-is. Poll on the UI task.
  * Each update contains the latest notification (up to 64 bytes), if any.
  * Status is optional and valid until the update object is reused. */
 const char *hb_ble_connect(const uint8_t address[HB_BLE_ADDRESS_SIZE]);
 const char *hb_ble_connect_notifications(const uint8_t address[HB_BLE_ADDRESS_SIZE]);
+/* Connect for text only and discover Nordic UART RX (write with response). */
+#define HB_BLE_CHAT_LIMIT 20u
+const char *hb_ble_connect_chat(const uint8_t address[HB_BLE_ADDRESS_SIZE]);
+bool hb_ble_chat_ready(void);
+/* Queue one printable ASCII message. Poll for the write response. */
+const char *hb_ble_chat_send(const char *text, unsigned length);
 /* Connected includes service discovery. Ready means TX is subscribed. */
 bool hb_ble_connected(void);
 bool hb_ble_ready(void);

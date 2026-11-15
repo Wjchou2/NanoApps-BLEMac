@@ -376,6 +376,7 @@ const char *hb_ble_scan(hb_ble_device_t found[HB_BLE_SCAN_LIMIT],
 #define LE_READ_TASK_TABLE 0x087ec3d8u
 #define LE_READ_TASK_DESTROY 0x08431f85u
 #define LE_ATT_READ 0x080e9f0du
+#define LE_ATT_WRITE 0x080ea60du
 #define LE_READ_RECORD_LIMIT 21u
 
 typedef void (*notification_fn)(uintptr_t, uintptr_t, uintptr_t, const uint8_t *, unsigned);
@@ -387,12 +388,15 @@ typedef int (*subscribe_fn)(uintptr_t, const uintptr_t *, unsigned, unsigned);
 
 static struct {
     uintptr_t owner, broker, session, central, ref;
-    bool changed_mode, receive_audio;
+    bool changed_mode, receive_audio, chat;
     uintptr_t expected_cookie;
     unsigned result;
     bool completed;
     uint16_t service_start, service_end, characteristic_handle, value_handle;
     uint16_t audio_read_handle;
+    uint16_t chat_handle;
+    bool chat_pending;
+    uint32_t chat_started;
     uint32_t read_started;
     bool read_pending, read_idle, read_ready;
     bool received;
@@ -414,6 +418,9 @@ static struct {
     bool active;
 } audio_read;
 static uintptr_t read_task_storage[5];
+/* ATT can retain the payload until the broker destroys the task. */
+static char chat_message[HB_BLE_CHAT_LIMIT];
+static unsigned chat_length;
 static uint32_t unload_started;
 static bool read_used, unload_waiting;
 
@@ -473,6 +480,9 @@ static void gatt_find_uart_attribute(uintptr_t vector, bool service)
         } else if (gatt.receive_audio && (properties & 0x02u) &&
                    gatt_is_uart_uuid(attribute + 28, 4)) {
             gatt.audio_read_handle = gatt_word(attribute + 26);
+        } else if (gatt.chat && (properties & 0x08u) &&
+                   gatt_is_uart_uuid(attribute + 28, 2)) {
+            gatt.chat_handle = gatt_word(attribute + 26);
         }
     }
 }
@@ -556,7 +566,32 @@ static int execute_audio_read(uintptr_t task)
     return error != 0;
 }
 
-static bool start_audio_read(void)
+static void complete_chat_write(unsigned status, uintptr_t att, uintptr_t task)
+{
+    (void)att;
+    audio_read.status = status;
+    uintptr_t attributes[3] = {0};
+    ((void (*)(uintptr_t, unsigned, uintptr_t *))0x083ec2a1u)(task, status, attributes);
+}
+
+static int execute_chat_write(uintptr_t task)
+{
+    typedef void (*write_callback_fn)(unsigned, uintptr_t, uintptr_t);
+    typedef int (*att_write_fn)(uintptr_t, write_callback_fn, unsigned, const char *, unsigned, uintptr_t);
+    uintptr_t guard = 0;
+    ((firmware_unlock_fn)0x083f0811u)(&guard);
+    int error = ((att_write_fn)LE_ATT_WRITE)(read_pointer(task + 12), complete_chat_write,
+                                            gatt_word(task + 20), chat_message, chat_length, task);
+    if (error)
+        audio_read.status = (unsigned)error;
+    ((firmware_unlock_fn)0x083f07fdu)(&guard);
+    ((firmware_unlock_fn)0x083f07f1u)(&guard);
+    return error != 0;
+}
+
+/* Reads and writes share the broker command slot. Use the stock command
+ * constructor and destructor, with an execute method for the chosen ATT call. */
+static bool start_att_task(uint16_t handle, int (*execute)(uintptr_t))
 {
     uintptr_t broker = ((get_ble_broker_fn)LE_GET_GATT_BROKER)();
     if (!in_sdram(broker, 0x64) || read_pointer(broker) != LE_GATT_BROKER_TABLE ||
@@ -571,9 +606,9 @@ static bool start_audio_read(void)
     ((task_init_fn)0x083d343du)(task, broker + 12, gatt.ref, 0);
     memcpy(read_task_storage, (const void *)(LE_READ_TASK_TABLE - 8), sizeof(read_task_storage));
     read_task_storage[3] = (uintptr_t)destroy_audio_read;
-    read_task_storage[4] = (uintptr_t)execute_audio_read;
+    read_task_storage[4] = (uintptr_t)execute;
     *(uintptr_t *)task = (uintptr_t)(read_task_storage + 2);
-    *(uint16_t *)(task + 20) = gatt.audio_read_handle;
+    *(uint16_t *)(task + 20) = handle;
 
     uintptr_t request[3] = {task, gatt.session, LE_READ_COOKIE};
     audio_read.status = 1;
@@ -635,7 +670,7 @@ static void finish_gatt(void)
     }
 }
 static const char *start_gatt(uintptr_t owner, uintptr_t session, uintptr_t central,
-                              uintptr_t ref, bool changed_mode, bool receive_audio)
+                              uintptr_t ref, bool changed_mode, bool receive_audio, bool chat)
 {
     uintptr_t broker = ((get_ble_broker_fn)LE_GET_BROKER)();
     if (!hb_shared)
@@ -669,6 +704,7 @@ static const char *start_gatt(uintptr_t owner, uintptr_t session, uintptr_t cent
         gatt.ref = ref;
         gatt.changed_mode = changed_mode;
         gatt.receive_audio = receive_audio;
+        gatt.chat = chat;
         gatt.expected_cookie = LE_SERVICES_COOKIE;
         gatt.started = lv_tick_get();
         *(volatile uintptr_t *)observer = (uintptr_t)gatt_observer_table;
@@ -710,7 +746,7 @@ void hb_ble_poll(hb_ble_update_t *update)
     if (!phase && (received || audio.received != gatt.audio_received ||
                    audio.state != gatt.audio_state || hb_pcm_playing()))
         gatt.started = lv_tick_get();
-    if (lv_tick_elaps(gatt.started) >= (phase ? 12000u : 60000u)) {
+    if ((phase || !gatt.chat) && lv_tick_elaps(gatt.started) >= (phase ? 12000u : 60000u)) {
         finish_gatt();
         update->status = phase ? "GATT setup timed out." : "BLE listening timed out.";
         return;
@@ -766,7 +802,8 @@ void hb_ble_poll(hb_ble_update_t *update)
                 update->status = "Notification subscription rejected.";
             }
         } else {
-            update->status = gatt.audio_read_handle ? "Subscribed. Checking GATT read..." :
+            update->status = gatt.chat ? (gatt.chat_handle ? "Connected." : "Connected. Update the Mac app to send.") :
+                             gatt.audio_read_handle ? "Subscribed. Checking GATT read..." :
                              gatt.receive_audio ? "Subscribed. Send text or audio." :
                                                   "Subscribed to UART TX.";
             if (gatt.audio_read_handle)
@@ -776,6 +813,20 @@ void hb_ble_poll(hb_ble_update_t *update)
 
     if (!gatt.ref || gatt.expected_cookie)
         return;
+    if (gatt.chat_pending) {
+        if (!read_task_active()) {
+            gatt.chat_pending = false;
+            if (audio_read.status) {
+                lv_snprintf(update->text, sizeof(update->text), "BLE write failed (%u).", audio_read.status);
+                update->status = update->text;
+            } else {
+                update->status = "Sent to Mac.";
+            }
+        } else if (lv_tick_elaps(gatt.chat_started) >= 12000u) {
+            finish_gatt();
+            update->status = "BLE write timed out. Reconnect to retry.";
+        }
+    }
     if (!gatt.receive_audio)
         return;
     if (gatt.audio_read_handle || gatt.playing_audio)
@@ -791,7 +842,7 @@ void hb_ble_poll(hb_ble_update_t *update)
         read_used = true;
         unload_waiting = false;
         gatt.read_started = lv_tick_get();
-        gatt.read_pending = start_audio_read();
+        gatt.read_pending = start_att_task(gatt.audio_read_handle, execute_audio_read);
         if (!gatt.read_pending) {
             gatt.audio_read_handle = 0;
             read_failed = true;
@@ -877,7 +928,7 @@ void hb_ble_poll(hb_ble_update_t *update)
     }
 }
 
-static const char *connect_uart(const uint8_t address[HB_BLE_ADDRESS_SIZE], bool receive_audio)
+static const char *connect_uart(const uint8_t address[HB_BLE_ADDRESS_SIZE], bool receive_audio, bool chat)
 {
     if (!address || !hb_shared || gatt.ref || read_task_active())
         return "BLE connection is unavailable or already active.";
@@ -966,7 +1017,7 @@ static const char *connect_uart(const uint8_t address[HB_BLE_ADDRESS_SIZE], bool
                     break;
             }
             if (linked) {
-                status = start_gatt(owner, session, central, ref, changed_mode, receive_audio);
+                status = start_gatt(owner, session, central, ref, changed_mode, receive_audio, chat);
                 if (!status) {
                     if (((connect_ble_fn)LE_DISCOVER_SERVICES)(gatt.owner, &gatt.ref))
                         return NULL;
@@ -991,12 +1042,44 @@ static const char *connect_uart(const uint8_t address[HB_BLE_ADDRESS_SIZE], bool
 
 const char *hb_ble_connect(const uint8_t address[HB_BLE_ADDRESS_SIZE])
 {
-    return connect_uart(address, true);
+    return connect_uart(address, true, false);
 }
 
 const char *hb_ble_connect_notifications(const uint8_t address[HB_BLE_ADDRESS_SIZE])
 {
-    return connect_uart(address, false);
+    return connect_uart(address, false, false);
+}
+
+const char *hb_ble_connect_chat(const uint8_t address[HB_BLE_ADDRESS_SIZE])
+{
+    if (*(const volatile uint32_t *)0x080ea60cu != 0x1e0db570u ||
+        *(const volatile uint32_t *)0x080ea620u != 0x0012f04fu)
+        return "BLE write firmware mismatch.";
+    return connect_uart(address, false, true);
+}
+
+bool hb_ble_chat_ready(void)
+{
+    return hb_ble_ready() && gatt.chat_handle && !gatt.chat_pending && !read_task_active();
+}
+
+const char *hb_ble_chat_send(const char *text, unsigned length)
+{
+    if (!hb_ble_chat_ready())
+        return "Connect or wait for the current message.";
+    if (!text || !length || length > sizeof(chat_message))
+        return "Enter up to 20 characters.";
+    for (unsigned i = 0; i < length; i++) {
+        if ((uint8_t)text[i] < 32 || (uint8_t)text[i] > 126)
+            return "Use printable ASCII text.";
+    }
+    memcpy(chat_message, text, length);
+    chat_length = length;
+    read_used = true;
+    unload_waiting = false;
+    gatt.chat_started = lv_tick_get();
+    gatt.chat_pending = start_att_task(gatt.chat_handle, execute_chat_write);
+    return gatt.chat_pending ? NULL : "Could not queue the BLE write.";
 }
 
 bool hb_ble_connected(void) { return gatt.ref != 0; }

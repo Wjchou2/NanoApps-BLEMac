@@ -32,7 +32,7 @@ const char *hb_h264_test_decode_group(const uint8_t *config, uint32_t config_siz
                                       uint32_t planes[VIDEO_LAYER_TEST_FRAMES][2]);
 void hb_h264_test_motion_release(void *pool);
 #endif
-/* Open an NVH1–NVH5 clip produced by Nano UART Sender. The original file
+/* Open an NVH1–NVH5 clip produced by Nano Bluetooth Link. The original file
  * stays on disk. Playback and the full-screen view are managed by the SDK. */
 const char *hb_h264_play_file(const char *path);
 /* Returns false while the display still owns a frame. Retry before unload. */

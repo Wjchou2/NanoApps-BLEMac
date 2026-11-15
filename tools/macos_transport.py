@@ -30,6 +30,26 @@ def devices():
     return result
 
 
+def peek_ejected(root, address, size, *, capture_output=False, timeout=None):
+    """Read RAM without discovering or loading the iPod's storage volume."""
+    binary = Path(root) / 'tools/macos/ipod_sg_raw'
+    data = bytearray()
+    with tempfile.TemporaryDirectory(prefix='nano-ejected-peek-') as td:
+        path = Path(td) / 'block'
+        while len(data) < size:
+            addr = address + len(data)
+            base = addr & ~511
+            subprocess.run([str(binary), '-r', '512', '-o', str(path),
+                            'auto', 'c6', '98', '02',
+                            *(f'{b:02x}' for b in base.to_bytes(4, 'big'))],
+                           check=True, capture_output=capture_output, timeout=timeout)
+            block = path.read_bytes()
+            if len(block) != 512:
+                raise RuntimeError('short ejected SCSI read')
+            data.extend(block[addr - base:addr - base + size - len(data)])
+    return bytes(data)
+
+
 class MacDevice:
     def __init__(self, root, disk=None):
         choices = devices()
@@ -110,20 +130,7 @@ class MacDevice:
 
     def peek_ejected(self, address, size):
         """Read without loading media: the nano must retain filesystem ownership."""
-        data = bytearray()
-        with tempfile.TemporaryDirectory(prefix='nano-ejected-peek-') as td:
-            path = Path(td) / 'block'
-            while len(data) < size:
-                addr = address + len(data)
-                base = addr & ~511
-                subprocess.run([str(self.root / 'tools/macos/ipod_sg_raw'),
-                    '-r', '512', '-o', str(path), 'auto', 'c6', '98', '02',
-                    *(f'{b:02x}' for b in base.to_bytes(4, 'big'))], check=True)
-                block = path.read_bytes()
-                if len(block) != 512:
-                    raise RuntimeError('short ejected SCSI read')
-                data.extend(block[addr - base:addr - base + size - len(data)])
-        return bytes(data)
+        return peek_ejected(self.root, address, size)
 
     def write(self, file, address):
         data = Path(file).read_bytes()

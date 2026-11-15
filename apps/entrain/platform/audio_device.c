@@ -100,6 +100,10 @@
 #include "hb_heap.h"
 #include "hb_shared.h"
 #include <stddef.h>
+#ifdef HB_LINKED_PCM
+#include "hb_linked_pcm.h"
+static bool g_linked_pcm;
+#endif
 
 #define SFX_CTOR_ADDR        (0x08417efcu | 1u)
 #define SFX_PLAYER_INST_ADDR (0x08417eb8u | 1u)
@@ -149,7 +153,9 @@
 /* Blocks in the ring. Two would be enough never to leave the chain empty — one
    sounding, one queued behind it — and the third is slack for a frame that runs
    long. */
-#define SLOTS 3
+#define CHAIN_SLOTS 3u
+#define BATCH_SLOTS 2u
+#define SLOTS (2u * BATCH_SLOTS)
 
 /* How much audio one tick will render. A block is over a second of lead time
    but only tens of milliseconds of work, so the work wants spreading rather
@@ -179,7 +185,7 @@
 #define BLOCK_MS      ((BLOCK_FRAMES * 1000u) / DEVICE_RATE)
 
 /* A long gap between UI ticks can hide a complete chain transition. */
-#define STARVED_MS (BLOCK_MS * SLOTS * 3)
+#define STARVED_MS (BLOCK_MS * CHAIN_SLOTS * 3)
 #define DETACH_SETTLE_MS 50u
 
 typedef void *(*sfx_ctor_t)(void *self);
@@ -237,6 +243,9 @@ static bool g_use_pcm_length;
 static uint32_t g_source_rate = DEVICE_RATE;
 static uint32_t g_block_frames = BLOCK_FRAMES;
 static bool g_short_video_blocks;
+static bool g_immutable_pcm;
+static uint8_t g_ready_batch[BATCH_SLOTS];
+static unsigned g_ready_count;
 static bool g_fade_in;              /* next block handed over ramps up */
 static int  g_volume = 45;
 static en_audio_state_t g_state = EN_AUDIO_IDLE;
@@ -352,16 +361,17 @@ static bool reserve(slot_t *slot, uint32_t frames)
     return true;
 }
 
-static bool reserve_stream_buffers(uint32_t block_frames)
+static bool reserve_stream_buffers(uint32_t block_frames, bool immutable)
 {
-    for (int i = 0; i < SLOTS; i++)
+    unsigned count = immutable ? SLOTS : CHAIN_SLOTS;
+    for (unsigned i = 0; i < count; i++)
         if (!reserve(&g_slot[i], block_frames)) return false;
     return reserve(&g_quiet, QUIET_FRAMES);
 }
 
 static bool buffers_ready(uint32_t block_frames)
 {
-    if (!reserve_stream_buffers(block_frames)) return false;
+    if (!reserve_stream_buffers(block_frames, g_immutable_pcm)) return false;
     for (uint32_t i = 0; i < QUIET_FRAMES * 2u; i++) g_quiet.pcm[i] = 0;
     g_quiet.frames = QUIET_FRAMES;
     return true;
@@ -455,21 +465,17 @@ static void enqueue(int idx)
        block at a time and run ahead of the sound. */
 }
 
-/* Start a voice on a block. Only needed to get going, or to recover after the
-   chain has run dry — everything after that is chained. */
-static bool play_slot(int idx)
+static bool play_prepared_slot(int idx)
 {
     slot_t *b = &g_slot[idx];
-    if (b->state != SLOT_READY || !b->pcm || !b->frames || desc_playing(b)) return false;
-
-    if (g_fade_in) { fade_in_head(b); g_fade_in = false; }
-    desc_build(b);
-
     void *player = ((sfx_player_inst_t)SFX_PLAYER_INST_ADDR)();
     if (!player) return false;
+    hb_trace_log("AudPlay", idx, b->frames);
     ((sfx_player_play_t)SFX_PLAYER_PLAY_ADDR)(player, b->desc,
                                               (void *)0, (void *)0);
-    if (!desc_playing(b)) return false;
+    bool playing = desc_playing(b);
+    hb_trace_log("AudPlayR", idx, playing);
+    if (!playing) return false;
 
     /* Only now does a voice exist to read the mixer rate from, so the
        descriptor just handed over went out with a zero duration - the safe
@@ -481,15 +487,50 @@ static bool play_slot(int idx)
        Safe to do while it sounds: voice+0x48 is written only by setSource and
        touched only by the exhaustion path, which this block will not reach for
        another second. */
-    learn_rate(b);
-
-    uint32_t v = *(volatile uint32_t *)(b->desc + SFX_OFF_VOICE);
-    if (g_out_rate && v && !(v & 3u) && duration_ms(b->frames))
-        *(volatile uint32_t *)(uintptr_t)(v + 0x48u) = b->frames;
+    if (!g_use_pcm_length) {
+        learn_rate(b);
+        uint32_t v = *(volatile uint32_t *)(b->desc + SFX_OFF_VOICE);
+        if (g_out_rate && v && !(v & 3u) && duration_ms(b->frames))
+            *(volatile uint32_t *)(uintptr_t)(v + 0x48u) = b->frames;
+    }
 
     enqueue(idx);
     g_head_start_ms = hb_time_uptime_ms();
     g_state = EN_AUDIO_PLAYING;
+    return true;
+}
+
+static bool play_slot(int idx)
+{
+    slot_t *b = &g_slot[idx];
+    if (b->state != SLOT_READY || !b->pcm || !b->frames || desc_playing(b)) return false;
+    if (g_fade_in) { fade_in_head(b); g_fade_in = false; }
+    desc_build(b);
+    return play_prepared_slot(idx);
+}
+
+/* Build every link before the mixer sees the head. Leave the entire batch
+   alone until retirement and the detach delay have both completed. */
+static bool play_immutable_batch(void)
+{
+    for (unsigned i = 0; i < g_ready_count; i++) {
+        slot_t *slot = &g_slot[g_ready_batch[i]];
+        if (slot->state != SLOT_READY || desc_playing(slot))
+            return false;
+        if (i == 0 && g_fade_in) {
+            fade_in_head(slot);
+            g_fade_in = false;
+        }
+        desc_build(slot);
+        if (i)
+            desc_chain(&g_slot[g_ready_batch[i - 1u]], slot);
+    }
+    hb_trace_log("AudBatch", g_ready_count, g_block_frames);
+    if (!play_prepared_slot(g_ready_batch[0]))
+        return false;
+    for (unsigned i = 1; i < g_ready_count; i++)
+        enqueue(g_ready_batch[i]);
+    g_ready_count = 0;
     return true;
 }
 
@@ -500,10 +541,19 @@ static bool chain_slot(int idx)
     slot_t *b = &g_slot[idx];
     if (b->state != SLOT_READY || !g_qn || desc_playing(b)) return false;
 
+    /* A previously active tail with its flag cleared may already have
+       consumed NEXT. Keep the ready block for the next voice instead. */
+    unsigned tail = g_q[g_qn - 1];
+    slot_t *last = &g_slot[tail];
+    if ((g_qn == 1 || last->seen_playing) && !desc_playing(last))
+        return false;
+
     if (g_fade_in) { fade_in_head(b); g_fade_in = false; }
     desc_build(b);
-    desc_chain(&g_slot[g_q[g_qn - 1]], b);
+    hb_trace_log("AudLink", tail, idx);
+    desc_chain(last, b);
     enqueue(idx);
+    hb_trace_log("AudLinkR", g_qn, desc_playing(b));
     return true;
 }
 
@@ -525,6 +575,8 @@ static uint32_t play_cursor(void)
  * silence a voice that is already sounding. */
 static void silence_now(void)
 {
+    if (g_immutable_pcm)
+        return;                    /* Let the mixer finish the submitted block. */
     for (uint8_t i = 0; i < g_qn; i++) {
         slot_t *b = &g_slot[g_q[i]];
         desc_chain(b, (slot_t *)0);
@@ -581,11 +633,13 @@ static void drop_queue(void)
         desc_chain(&g_quiet, NULL);
     for (uint8_t i = 0; i < g_qn; i++) {
         slot_t *b = &g_slot[g_q[i]];
-        desc_chain(b, NULL);
-        b->state = SLOT_FREE;
+        if (!g_immutable_pcm)
+            desc_chain(b, NULL);
+        b->state = g_immutable_pcm ? SLOT_RETIRED : SLOT_FREE;
         b->fill = 0;
     }
     g_qn = 0;
+    g_ready_count = 0;
     for (unsigned i = 0; i < SLOTS; i++)
         detached |= g_slot[i].state == SLOT_RETIRED;
     if (detached && !g_detached) {
@@ -619,6 +673,10 @@ static bool detached_audio_busy(void)
 
 static int prepare_unload(void)
 {
+#ifdef HB_LINKED_PCM
+    if (!hb_linked_pcm_stop()) return 0;
+    g_linked_pcm = false;
+#endif
     g_stopping = true;
     s_pull = (en_audio_pull_fn)0;
     silence_now();
@@ -643,6 +701,10 @@ bool en_audio_init(void)
 
 void en_audio_shutdown(void)
 {
+#ifdef HB_LINKED_PCM
+    hb_linked_pcm_stop();
+    g_linked_pcm = false;
+#endif
     silence_now();
     release_quiet();
     g_stopping = true;
@@ -666,13 +728,20 @@ static bool g_start_pending;
 static bool start_voice(void)
 {
     g_start_pending = false;
-    if (!buffers_ready(g_block_frames)) {
+    bool have_buffers = buffers_ready(g_block_frames);
+    if (!have_buffers && g_immutable_pcm && g_block_frames == BLOCK_FRAMES * 2u) {
+        /* Some heaps cannot fit four longer blocks. Keep the immutable
+           handoff and use the original block size in that case. */
+        g_block_frames = BLOCK_FRAMES;
+        have_buffers = buffers_ready(g_block_frames);
+    }
+    if (!have_buffers) {
         hb_trace_log("AudAlloc", g_block_frames, hb_os_heap_largest());
         s_pull = NULL;
         g_state = EN_AUDIO_FAILED;
         return false;
     }
-    for (int i = 0; i < SLOTS; i++) {
+    for (unsigned i = 0; i < SLOTS; i++) {
         g_slot[i].state = SLOT_FREE;
         g_slot[i].fill = 0;
     }
@@ -681,14 +750,26 @@ static bool start_voice(void)
        playback, leave the duration hint at zero so it follows PCM exhaustion
        even if the output route is still changing its rate. */
     uint32_t opening_frames = g_block_frames;
-    if (g_stream_kind == WAV_AUDIO && reserve(&g_slot[0], FILE_OPENING_FRAMES))
+    if (!g_immutable_pcm && g_stream_kind == WAV_AUDIO && reserve(&g_slot[0], FILE_OPENING_FRAMES))
         opening_frames = FILE_OPENING_FRAMES;
     unsigned ready = build_now(0, opening_frames) ? 1u : 0u;
-    while ((g_stream_kind == WAV_AUDIO || g_stream_kind == VIDEO_AUDIO) &&
-           ready && ready < SLOTS && s_pull && !s_source_done &&
+    unsigned startup_slots = g_immutable_pcm ? BATCH_SLOTS : CHAIN_SLOTS;
+    while ((g_immutable_pcm || g_stream_kind == WAV_AUDIO || g_stream_kind == VIDEO_AUDIO) &&
+           ready && ready < startup_slots && s_pull && !s_source_done &&
            build_now(ready, g_block_frames))
         ready++;
     if (!ready || !s_pull) {
+        s_pull = NULL;
+        g_state = EN_AUDIO_FAILED;
+        return false;
+    }
+
+    if (g_immutable_pcm) {
+        for (unsigned i = 0; i < ready; i++)
+            g_ready_batch[g_ready_count++] = (uint8_t)i;
+        g_last_tick_ms = hb_time_uptime_ms();
+        if (play_immutable_batch())
+            return true;
         s_pull = NULL;
         g_state = EN_AUDIO_FAILED;
         return false;
@@ -722,11 +803,22 @@ static bool start_voice(void)
     return true;
 }
 
-static bool start_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx, stream_kind_t kind)
+static bool start_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx, stream_kind_t kind,
+                         uint32_t block_frames)
 {
     if (!pull || (rate != DEVICE_RATE && rate != 44100u)) return false;
+#ifdef HB_LINKED_PCM
+    if (hb_linked_pcm_busy()) return false;
+    g_linked_pcm = false;
+#endif
     silence_now();
     drop_queue();
+#if defined(NANO_YOUTUBE_AUDIO) || defined(NANO_YOUTUBE_VIDEO)
+    g_immutable_pcm = kind != RENDERED_AUDIO && hb_fs_exists("/Data/YouTube-immutable-pcm");
+    if (g_immutable_pcm && rate == 44100u && (kind == WAV_AUDIO || kind == LIVE_AUDIO))
+        block_frames = BLOCK_FRAMES * 2u;  /* Match the 22.05 kHz block duration. */
+    hb_trace_log("AudMode", g_immutable_pcm, block_frames);
+#endif
     s_pull = pull;
     s_pull_ctx = ctx;
     s_source_done = false;
@@ -738,7 +830,7 @@ static bool start_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx, stream
     g_stopping = false;
     g_fade_in = true;
     g_source_rate = rate;
-    g_block_frames = kind == VIDEO_AUDIO ? rate / 10u : BLOCK_FRAMES;
+    g_block_frames = block_frames;
     g_short_video_blocks = kind == VIDEO_AUDIO;
     g_use_pcm_length = kind != RENDERED_AUDIO;
     g_stream_kind = kind;
@@ -754,37 +846,87 @@ bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
                            void *ctx)
 {
     (void)sample_rate;             /* the descriptor is told DEVICE_RATE */
-    return start_stream(DEVICE_RATE, pull, ctx, RENDERED_AUDIO);
+    return start_stream(DEVICE_RATE, pull, ctx, RENDERED_AUDIO, BLOCK_FRAMES);
 }
 
 bool en_audio_start_buffered_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx)
 {
-    return start_stream(rate, pull, ctx, WAV_AUDIO);
+    return start_stream(rate, pull, ctx, WAV_AUDIO, BLOCK_FRAMES);
 }
+
+#ifdef HB_LINKED_PCM
+bool en_audio_start_linked_stream(uint32_t rate, uint64_t frames, en_audio_pull_fn pull,
+                                  void *ctx, bool live)
+{
+    if (hb_linked_pcm_busy()) return false;
+    if (!s_pull && !g_qn && !g_quiet_armed && !desc_playing(&g_quiet) && !detached_audio_busy()) {
+        int result = hb_linked_pcm_start(rate, frames, pull, ctx, os_volume(), live);
+        if (result) {
+            g_linked_pcm = true;
+            return result > 0;
+        }
+    }
+    return live ? en_audio_start_live_stream(rate, pull, ctx) :
+                  en_audio_start_buffered_stream(rate, pull, ctx);
+}
+
+bool en_audio_uses_linked_pcm(void) { return g_linked_pcm; }
+bool en_audio_stop_linked_stream(void) { return hb_linked_pcm_stop(); }
+
+int en_audio_start_linked_video(uint32_t rate, en_audio_pull_fn pull, void *ctx, unsigned block_ms)
+{
+    if (hb_linked_pcm_busy())
+        return -1;
+    if (s_pull || g_qn || g_quiet_armed || desc_playing(&g_quiet) || detached_audio_busy())
+        return 0;
+    int result = hb_linked_pcm_start_video(rate, pull, ctx, os_volume(), block_ms);
+    g_linked_pcm = result != 0;
+    return result;
+}
+#endif
 
 bool en_audio_start_live_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx)
 {
-    return start_stream(rate, pull, ctx, LIVE_AUDIO);
+    return start_stream(rate, pull, ctx, LIVE_AUDIO, BLOCK_FRAMES);
 }
 
-bool en_audio_reserve_video_buffers(void)
+bool en_audio_reserve_video_buffers(unsigned block_ms)
 {
-    /* Cover the largest 100 ms video block before allocating decoder frames. */
-    return reserve_stream_buffers(44100u / 10u);
+    /* Cover the maximum output rate before allocating decoder frames. */
+    bool immutable = false;
+#if defined(NANO_YOUTUBE_AUDIO) || defined(NANO_YOUTUBE_VIDEO)
+    immutable = hb_fs_exists("/Data/YouTube-immutable-pcm");
+#endif
+    return reserve_stream_buffers(44100u * block_ms / 1000u, immutable);
 }
 
-bool en_audio_start_video_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx)
+bool en_audio_start_video_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx, unsigned block_ms)
 {
-    return start_stream(rate, pull, ctx, VIDEO_AUDIO);
+    return start_stream(rate, pull, ctx, VIDEO_AUDIO, rate * block_ms / 1000u);
 }
 
 bool en_audio_stream_buffering(void)
 {
-    return g_state == EN_AUDIO_PLAYING && (g_refilling || !g_qn);
+#ifdef HB_LINKED_PCM
+    if (g_linked_pcm) return hb_linked_pcm_buffering();
+#endif
+    if (g_state != EN_AUDIO_PLAYING)
+        return false;
+    if (g_immutable_pcm)
+        return g_refilling || (!g_qn && !g_ready_count && s_waiting_for_input);
+    return g_refilling || !g_qn;
 }
+
+bool en_audio_uses_immutable_pcm(void) { return g_immutable_pcm; }
 
 void en_audio_queue_status(unsigned *queued, unsigned *playing_mask)
 {
+#ifdef HB_LINKED_PCM
+    if (g_linked_pcm) {
+        hb_linked_pcm_queue_status(queued, playing_mask);
+        return;
+    }
+#endif
     *queued = g_qn;
     *playing_mask = 0;
     for (unsigned i = 0; i < SLOTS; i++)
@@ -794,8 +936,18 @@ void en_audio_queue_status(unsigned *queued, unsigned *playing_mask)
 
 void en_audio_tick_with_refill(bool refill_ready)
 {
+#ifdef HB_LINKED_PCM
+    if (g_linked_pcm) {
+        hb_linked_pcm_set_refill_ready(refill_ready);
+#ifdef NANO_YOUTUBE_VIDEO
+        hb_linked_pcm_tick();
+#endif
+        return;
+    }
+#endif
     uint32_t now = hb_time_uptime_ms();
-    if (!g_refilling && !g_paused && !g_qn && s_waiting_for_input && s_pull) {
+    if (!g_refilling && !g_paused && !g_qn && !g_ready_count && s_waiting_for_input &&
+        s_pull && (!g_immutable_pcm || (!g_detached && !refill_ready))) {
         hb_trace_log("AudWait", (uint32_t)g_frames_done, g_block_frames);
         g_refilling = true;
         g_refill_started = now;
@@ -846,6 +998,10 @@ void en_audio_stop(uint32_t fade_ms)
 
 void en_audio_set_paused(bool paused)
 {
+    if (g_immutable_pcm) {
+        en_audio_set_stream_paused(paused);
+        return;
+    }
     if (paused == g_paused) return;
     g_paused = paused;
 
@@ -866,6 +1022,12 @@ void en_audio_set_paused(bool paused)
 
 void en_audio_set_stream_paused(bool paused)
 {
+#ifdef HB_LINKED_PCM
+    if (g_linked_pcm) {
+        hb_linked_pcm_pause(paused);
+        return;
+    }
+#endif
     if (paused == g_paused || !s_pull)
         return;
     g_paused = paused;
@@ -904,8 +1066,41 @@ static bool chain_drained(uint32_t elapsed)
     return elapsed >= (frames * 1000u + g_source_rate - 1u) / g_source_rate + 100u;
 }
 
+/* The pending batch holds source order even when slot indices wrap. A
+   partial PCM block also has priority over a free slot. */
+static void advance_immutable_pcm(void)
+{
+    if (g_ready_count < BATCH_SLOTS && !s_source_done) {
+        int next = -1;
+        for (unsigned i = 0; i < SLOTS; i++) {
+            if (g_slot[i].state == SLOT_BUILD) {
+                next = (int)i;
+                break;
+            }
+            if (next < 0 && g_slot[i].state == SLOT_FREE)
+                next = (int)i;
+        }
+        if (next >= 0 && build_step(next, g_block_frames))
+            g_ready_batch[g_ready_count++] = (uint8_t)next;
+    }
+    if (g_qn || !s_pull)
+        return;
+    if (g_ready_count && (g_ready_count == BATCH_SLOTS || s_source_done || s_waiting_for_input)) {
+        if (!play_immutable_batch()) {
+            s_pull = NULL;
+            g_state = EN_AUDIO_FAILED;
+        }
+    } else if (!g_ready_count && s_source_done) {
+        s_pull = NULL;
+        g_state = EN_AUDIO_IDLE;
+    }
+}
+
 void en_audio_tick(void)
 {
+#ifdef HB_LINKED_PCM
+    if (g_linked_pcm) return; /* The linked player has its own mixer timer. */
+#endif
     if (!s_pull) return;
 
     uint32_t now = hb_time_uptime_ms();
@@ -926,7 +1121,7 @@ void en_audio_tick(void)
        descriptor up, cleared by the completion handler when the buffer has been
        played out. Waiting to see it set first is what distinguishes a block
        that has finished from one that has not started. */
-    bool drained = (g_short_video_blocks || since > STARVED_MS) &&
+    bool drained = (g_use_pcm_length || since > STARVED_MS) &&
                    chain_drained(now - g_head_start_ms);
     while (g_qn) {
         slot_t *h = &g_slot[g_q[0]];
@@ -960,13 +1155,23 @@ void en_audio_tick(void)
             }
         }
 
-        h->state = successor_playing ? SLOT_FREE : SLOT_RETIRED;
+        h->state = successor_playing && !g_use_pcm_length ? SLOT_FREE : SLOT_RETIRED;
         h->retired_ms = now;
         h->fill = 0;
         g_frames_done += h->frames;       /* this one really has played */
         for (uint8_t i = 1; i < g_qn; i++) g_q[i - 1] = g_q[i];
         g_qn--;
         g_head_start_ms = now;
+        if (g_use_pcm_length) {
+            hb_trace_log("AudRet", (uint32_t)g_frames_done, g_qn);
+            if (!g_qn) {
+                /* The last flag may clear before the voice finishes tearing
+                   down. Wait before reusing its descriptor or starting again. */
+                g_detached_ms = now;
+                g_detached = true;
+                return;
+            }
+        }
     }
 
     if (g_paused) {
@@ -984,12 +1189,17 @@ void en_audio_tick(void)
         return;
     }
 
+    if (g_immutable_pcm) {
+        advance_immutable_pcm();
+        return;
+    }
+
     /* Build one slice into whichever block is free, then hand over anything
        ready. A block of lead time against a few milliseconds of work per tick,
        so the chain is extended long before the voice reaches its end and no
        single frame carries enough of the rendering to be seen. */
     int ready = -1;
-    for (int i = 0; i < SLOTS; i++) {
+    for (unsigned i = 0; i < CHAIN_SLOTS; i++) {
         slot_t *slot = &g_slot[i];
         if (slot->state == SLOT_RETIRED && now - slot->retired_ms >= DETACH_SETTLE_MS &&
             !desc_playing(slot))
@@ -1009,6 +1219,8 @@ void en_audio_tick(void)
                A fresh voice has to be started, and that join is covered by the
                fade-in rather than by anything clever. */
             release_quiet();
+            if (desc_playing(&g_quiet))
+                return;
             if (!play_slot(ready)) {
                 hb_trace_log("AudRetry", (uint32_t)g_frames_done, g_slot[ready].frames);
                 s_pull = NULL;
@@ -1025,10 +1237,19 @@ void en_audio_tick(void)
     }
 }
 
-en_audio_state_t en_audio_state(void) { return g_state; }
+en_audio_state_t en_audio_state(void)
+{
+#ifdef HB_LINKED_PCM
+    if (g_linked_pcm) return hb_linked_pcm_state();
+#endif
+    return g_state;
+}
 
 double en_audio_elapsed(void)
 {
+#ifdef HB_LINKED_PCM
+    if (g_linked_pcm) return hb_linked_pcm_elapsed();
+#endif
     /* Blocks that have finished, plus however far into the sounding one the
        wall clock says we are - capped at that block's length so a stall cannot
        push the clock past audio that has not been played. */

@@ -92,7 +92,6 @@ enum ClassicQuality: CaseIterable {
     }
 
     var channels: UInt16 { self == .fullStereo ? 2 : 1 }
-    var bytesPerSecond: Int { Int(sampleRate) * Int(channels) * 2 }
 
     var label: String {
         switch self {
@@ -102,50 +101,6 @@ enum ClassicQuality: CaseIterable {
         case .fullMono: "Full (44.1 kHz mono)"
         case .fullStereo: "Full (44.1 kHz stereo)"
         }
-    }
-}
-
-enum ClassicAudio {
-    private static let headerSize = 44
-    private static let maxSeconds = 300
-    static let fileTypes: [UTType] = [.wav, .mp3, .mpeg4Audio, .aiff]
-
-    static func wav(from url: URL, quality: ClassicQuality) throws -> Data {
-        let sampleRate = quality.sampleRate
-        let frameLimit = Int(sampleRate) * maxSeconds
-        let channels = quality.channels
-        let output = try decodeAudio(url, rate: Double(sampleRate), frameLimit: frameLimit,
-                                     maxDurationLabel: String(maxSeconds), channels: UInt32(channels))
-        guard let samples = output.floatChannelData else { throw AudioLoadError.invalidAudio }
-        let frames = Int(output.frameLength)
-        guard frames <= frameLimit else { throw AudioLoadError.tooLong(String(maxSeconds)) }
-        let dataSize = UInt32(frames * Int(channels) * 2)
-        var wav = Data()
-        wav.reserveCapacity(headerSize + Int(dataSize))
-        func append<T: FixedWidthInteger>(_ value: T) {
-            var littleEndian = value.littleEndian
-            withUnsafeBytes(of: &littleEndian) { wav.append(contentsOf: $0) }
-        }
-        wav.append(contentsOf: "RIFF".utf8)
-        append(dataSize + 36)
-        wav.append(contentsOf: "WAVEfmt ".utf8)
-        append(UInt32(16))
-        append(UInt16(1)) // PCM
-        append(channels)
-        append(sampleRate)
-        append(UInt32(quality.bytesPerSecond))
-        append(channels * 2)
-        append(UInt16(16))
-        wav.append(contentsOf: "data".utf8)
-        append(dataSize)
-        for i in 0..<frames {
-            for channel in 0..<Int(channels) {
-                let value = samples[channel][i]
-                let sample = value.isFinite ? min(1, max(-1, value)) : 0
-                append(Int16(sample * 32767))
-            }
-        }
-        return wav
     }
 }
 
@@ -216,6 +171,7 @@ private final class UARTPeripheral: NSObject, ObservableObject, CBPeripheralMana
 
     private var service: CBMutableService?
     private var tx: CBMutableCharacteristic?
+    private var rx: CBMutableCharacteristic?
     private var audioRead: CBMutableCharacteristic?
     private var manager: CBPeripheralManager!
     private var serviceRegistered = false
@@ -242,6 +198,7 @@ private final class UARTPeripheral: NSObject, ObservableObject, CBPeripheralMana
     }
 
     @Published private(set) var status = "Starting Bluetooth…"
+    @Published private(set) var receivedMessage = ""
     @Published private(set) var notificationLimit = 0
     var byteLimit: Int { min(notificationLimit, 64) }
     var audioPacketOverhead: Int { audioTransport == .fast ? 2 : 6 }
@@ -260,6 +217,7 @@ private final class UARTPeripheral: NSObject, ObservableObject, CBPeripheralMana
         serviceRegistered = false
         service = nil
         tx = nil
+        rx = nil
         audioRead = nil
         subscribers.removeAll()
         readCentral = nil
@@ -288,6 +246,7 @@ private final class UARTPeripheral: NSObject, ObservableObject, CBPeripheralMana
         if let error {
             self.service = nil
             tx = nil
+            rx = nil
             audioRead = nil
             status = "Could not register UART. \(error.localizedDescription)"
             return
@@ -313,6 +272,10 @@ private final class UARTPeripheral: NSObject, ObservableObject, CBPeripheralMana
                 type: CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"),
                 properties: [.notify], value: nil, permissions: []
             )
+            let rx = CBMutableCharacteristic(
+                type: CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"),
+                properties: [.write], value: nil, permissions: [.writeable]
+            )
             let audioRead = CBMutableCharacteristic(
                 type: CBUUID(string: "6E400004-B5A3-F393-E0A9-E50E24DCCA9E"),
                 properties: [.read], value: nil, permissions: [.readable]
@@ -320,8 +283,9 @@ private final class UARTPeripheral: NSObject, ObservableObject, CBPeripheralMana
             let service = CBMutableService(
                 type: CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"), primary: true
             )
-            service.characteristics = [tx, audioRead]
+            service.characteristics = [tx, audioRead, rx]
             self.tx = tx
+            self.rx = rx
             self.audioRead = audioRead
             self.service = service
             status = "Registering Nordic UART…"
@@ -330,7 +294,7 @@ private final class UARTPeripheral: NSObject, ObservableObject, CBPeripheralMana
             return
         }
         let address = advertisingClassic ? ClassicIdentity.localAddress : nil
-        let name = address.map { "NM-" + $0.replacingOccurrences(of: ":", with: "") } ?? "Nano UART"
+        let name = address.map { "NM-" + $0.replacingOccurrences(of: ":", with: "") } ?? "Nano Bluetooth Link"
         if advertisingClassic {
             classicDiscoveryHint = address.map { "On the nano, use Find Mac, or Scan BLE in Bluetooth Test. Mac address \($0)." }
                 ?? "macOS did not provide the Mac’s Classic Bluetooth address."
@@ -347,7 +311,7 @@ private final class UARTPeripheral: NSObject, ObservableObject, CBPeripheralMana
                     ?? status
             }
         } else if !advertisingClassic && subscribers.isEmpty {
-            status = "Advertising Nano UART. Scan and connect on the iPod."
+            status = "Advertising. Connect from BLE Chat or Bluetooth Test on the iPod."
         }
     }
 
@@ -359,7 +323,7 @@ private final class UARTPeripheral: NSObject, ObservableObject, CBPeripheralMana
         guard let tx, characteristic.uuid == tx.uuid else { return }
         subscribers[central.identifier] = central
         refreshSendState()
-        status = "Subscribed. Checking for GATT reads…"
+        status = "Connected. Send a message or audio."
     }
 
     func peripheralManager(
@@ -381,6 +345,26 @@ private final class UARTPeripheral: NSObject, ObservableObject, CBPeripheralMana
         if subscribers.isEmpty {
             status = "Waiting for the iPod to subscribe again."
         }
+    }
+
+    func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
+        guard let request = requests.first else { return }
+        guard requests.count == 1, let rx, request.characteristic.uuid == rx.uuid,
+              subscribers[request.central.identifier] != nil else {
+            peripheral.respond(to: request, withResult: .requestNotSupported)
+            return
+        }
+        guard request.offset == 0 else {
+            peripheral.respond(to: request, withResult: .invalidOffset)
+            return
+        }
+        guard let bytes = request.value, (1...20).contains(bytes.count),
+              bytes.allSatisfy({ (32...126).contains($0) }) else {
+            peripheral.respond(to: request, withResult: .invalidAttributeValueLength)
+            return
+        }
+        receivedMessage = String(decoding: bytes, as: UTF8.self)
+        peripheral.respond(to: request, withResult: .success)
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
@@ -600,11 +584,11 @@ private final class UARTPeripheral: NSObject, ObservableObject, CBPeripheralMana
 }
 
 @main
-private struct NanoUARTSender: App {
-    private enum Tab { case ble, classic, stream, youtube, youtubeVideo }
+private struct NanoBluetoothLink: App {
+    private enum Tab { case ble, youtube, youtubeVideo }
 
     @StateObject private var uart = UARTPeripheral()
-    @State private var selectedTab = Tab.classic
+    @State private var selectedTab = Tab.youtube
     @State private var message = "Hello"
     @State private var choosingAudio = false
     @State private var quality = AudioQuality.high
@@ -612,7 +596,7 @@ private struct NanoUARTSender: App {
     @State private var showingAudioSettings = false
 
     var body: some Scene {
-        Window("Nano UART Sender", id: "sender") {
+        Window("Nano Bluetooth Link", id: "sender") {
             TabView(selection: $selectedTab) {
                 VStack(alignment: .leading, spacing: 16) {
                     Text(uart.status)
@@ -624,6 +608,10 @@ private struct NanoUARTSender: App {
                             .onSubmit { uart.send(message) }
                         Button("Send") { uart.send(message) }
                             .disabled(!uart.canSend || message.isEmpty)
+                    }
+                    if !uart.receivedMessage.isEmpty {
+                        LabeledContent("From Nano", value: uart.receivedMessage)
+                            .textSelection(.enabled)
                     }
                     if uart.byteLimit > 0 {
                         Text("Up to \(uart.byteLimit) printable ASCII characters")
@@ -673,20 +661,18 @@ private struct NanoUARTSender: App {
                 }
                 .tabItem { Text("BLE") }
                 .tag(Tab.ble)
-                ClassicFilesView(discoveryHint: uart.classicDiscoveryHint)
-                    .tabItem { Text("Classic Files") }
-                    .tag(Tab.classic)
-                ClassicFilesView(discoveryHint: uart.classicDiscoveryHint, streamOnly: true)
-                    .tabItem { Text("Stream") }
-                    .tag(Tab.stream)
-                ClassicFilesView(discoveryHint: uart.classicDiscoveryHint, youtubeOnly: true)
-                    .tabItem { Text("YouTube Audio") }
-                    .tag(Tab.youtube)
-                ClassicFilesView(discoveryHint: uart.classicDiscoveryHint, youtubeVideoOnly: true)
-                    .tabItem { Text("YouTube Streamer") }
-                    .tag(Tab.youtubeVideo)
+                ScrollView {
+                    ClassicMediaView(discoveryHint: uart.classicDiscoveryHint, destination: .youtubeAudio)
+                }
+                .tabItem { Text("YT Music") }
+                .tag(Tab.youtube)
+                ScrollView {
+                    ClassicMediaView(discoveryHint: uart.classicDiscoveryHint, destination: .youtubeStreamer)
+                }
+                .tabItem { Text("YT Video") }
+                .tag(Tab.youtubeVideo)
             }
-            .onChange(of: selectedTab) { _, tab in
+            .onChange(of: selectedTab, initial: true) { _, tab in
                 uart.setClassicDiscovery(tab != .ble)
             }
             .frame(width: 490, height: 440)

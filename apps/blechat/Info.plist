@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key> <string>org.nanoapps.blechat</string>
+    <key>CFBundleName</key> <string>BLE Chat</string>
+    <key>CFBundleExecutable</key> <string>blechat</string>
+    <key>HBAppKind</key> <integer>1</integer>
+    <key>HBIconGlyph</key> <string>comment</string>
+    <key>HBIconColor</key> <string>#1679b1</string>
+</dict>
+</plist>

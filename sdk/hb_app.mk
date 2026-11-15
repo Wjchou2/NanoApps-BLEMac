@@ -104,7 +104,8 @@ ifneq ($(strip $(HB_CLASSIC)),)
       EXTRA_CFLAGS += -DNANO_YOUTUBE_VIDEO
     endif
     ifneq ($(filter $(HB_CLASSIC),youtube_audio youtube_video),)
-      EXTRA_CFLAGS += -DNANO_YOUTUBE_SEARCH -DHB_LV_LANDSCAPE
+      SDK_SRCS += $(SDK_DIR)/hb_linked_pcm.c
+      EXTRA_CFLAGS += -DNANO_YOUTUBE_SEARCH -DHB_LV_LANDSCAPE -DHB_LINKED_PCM
     endif
     ifeq ($(HB_CLASSIC),youtube_audio)
       EXTRA_CFLAGS += -DNANO_YOUTUBE_AUDIO

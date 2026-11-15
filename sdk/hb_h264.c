@@ -171,6 +171,8 @@ typedef struct {
 static struct {
     video_timing prepare, submit, convert, group, read, draw;
     uint32_t presented, skipped, stalls, refresh_retries;
+    uint32_t heap_free, heap_largest, min_free, min_largest, last_snapshot_ms;
+    unsigned snapshots;
     bool active, buffering;
 } video_perf;
 
@@ -193,7 +195,7 @@ static void save_video_timings(unsigned fps, bool from_disk, unsigned queue_fram
 {
     char report[768];
     int length = lv_snprintf(report, sizeof(report),
-        "YouTube Streamer playback\nMode: %s, %u FPS\nDisplay: %s\n"
+        "YT Video playback\nMode: %s, %u FPS\nDisplay: %s\n"
         "Decoded frame queue capacity: %u frames\n"
         "Frames drawn: %lu, frames skipped: %lu, buffer stalls: %lu\n"
         "Panel refresh retries: %lu\n"
@@ -738,6 +740,17 @@ static const char *decode_to_planes(const h264_clip *clip, decoder_frame *frames
                           clip->count <= 1 ? 1024u * 1024u : POOL_BYTES;
     if (clip->service_audio) {
         uint32_t largest = hb_os_heap_largest();
+#ifdef NANO_YOUTUBE_VIDEO
+        /* Bytes immediately before the stock pool call, in the reboot trace. */
+        uint32_t free = hb_os_heap_free();
+        hb_trace_log("VHeap", free, largest);
+        video_perf.heap_free = free;
+        video_perf.heap_largest = largest;
+        if (free < video_perf.min_free)
+            video_perf.min_free = free;
+        if (largest < video_perf.min_largest)
+            video_perf.min_largest = largest;
+#endif
         if (largest < pool_bytes + DECODER_HEAP_MARGIN) {
             checkpoint("VLowMem", pool_bytes, largest);
             return decoder_low_memory;
@@ -1106,6 +1119,9 @@ static bool video_paused;
 static uint32_t video_paused_at;
 static void toggle_video_pause(lv_event_t *event);
 static void close_movie(lv_event_t *event);
+#ifdef NANO_YOUTUBE_VIDEO
+static bool pause_silent_video(void);
+#endif
 #ifdef HB_VIDEO_LAYER
 static void update_layer_visibility(void);
 #endif
@@ -1298,6 +1314,9 @@ static void toggle_video_pause(lv_event_t *event)
         else
             playback.started += now - video_paused_at;
     } else {
+#ifdef NANO_YOUTUBE_VIDEO
+        if (!pause_silent_video())
+#endif
         en_audio_set_stream_paused(video_paused);
     }
     lv_label_set_text(video_pause_label, video_paused ? "Resume" : "Pause");
@@ -1615,7 +1634,7 @@ static struct {
     uint32_t pending_decode_us;
     lv_obj_t *canvas;
     uint32_t count, fps, rate, channels, repeat, config_size, audio_slot_size;
-    unsigned width, height, groups, group_frames;
+    unsigned width, height, groups, group_frames, audio_block_ms;
     uint32_t loaded, audio_group;
     uint64_t audio_frame, audio_group_start, audio_group_end;
     uint32_t ima_sample;
@@ -1624,12 +1643,50 @@ static struct {
     bool started, cancelled, from_disk, awake, native, adpcm, audio_eof_logged;
     bool direct_display, closing, refresh_pending;
     uint32_t refresh_blocked_at;
+#ifdef NANO_YOUTUBE_VIDEO
+    uint32_t video_started_at;
+    bool silent, mixer_silence, audio_only;
+#endif
     const char *end_reason;
     lv_timer_t *timer;
 } stream;
 
 static const char *live_playback_error;
 static void advance_spooled_stream(lv_timer_t *timer);
+
+#ifdef NANO_YOUTUBE_VIDEO
+static bool pause_silent_video(void)
+{
+    if (!stream.silent)
+        return false;
+    uint32_t now = lv_tick_get();
+    if (video_paused)
+        video_paused_at = now;
+    else
+        stream.video_started_at += now - video_paused_at;
+    return true;
+}
+#endif
+
+static bool stream_uses_mixer(void)
+{
+#ifdef NANO_YOUTUBE_VIDEO
+    return !stream.silent;
+#else
+    return true;
+#endif
+}
+
+static const char *stream_audio_test_label(void)
+{
+#ifdef NANO_YOUTUBE_VIDEO
+    if (stream.audio_only)
+        return ", audio only (video disabled)";
+    if (stream.mixer_silence)
+        return ", mixer fed silent PCM";
+#endif
+    return stream_uses_mixer() ? "" : ", mixer bypassed";
+}
 
 #ifdef HB_VIDEO_LAYER
 static uint8_t *dma_buffer(void *allocation)
@@ -1760,10 +1817,10 @@ static void log_saved_video_end(const char *stage)
     unsigned queued, playing;
     en_audio_queue_status(&queued, &playing);
     int size = lv_snprintf(line, sizeof(line),
-        "%s\n%u x %u, %u FPS, %u Hz, %u channels\n"
+        "%s\n%u x %u, %u FPS, %u Hz, %u channels%s\n"
         "Decoded frames: %lu / %lu\nQueued audio blocks: %u, mixer flags: %x\n",
         stage, stream.width, stream.height, (unsigned)stream.fps,
-        (unsigned)stream.rate, (unsigned)stream.channels,
+        (unsigned)stream.rate, (unsigned)stream.channels, stream_audio_test_label(),
         (unsigned long)stream.loaded, (unsigned long)stream.count, queued, playing);
     if (size > 0 && (size_t)size < sizeof(line))
         hb_fs_write("/Data/VideoStream-end.txt", line, (uint32_t)size);
@@ -1837,6 +1894,16 @@ static bool begin_group_playback(const uint8_t *config, uint32_t size, uint32_t 
         return false;
     }
     stream.native = native;
+    stream.audio_block_ms = 100u;
+#ifdef NANO_YOUTUBE_VIDEO
+    stream.silent = from_disk && hb_fs_exists("/Data/YouTubeStreamer-silent-test");
+    stream.mixer_silence = from_disk && !stream.silent &&
+                          hb_fs_exists("/Data/YouTubeStreamer-mixer-test");
+    stream.audio_only = from_disk && !stream.silent && !stream.mixer_silence &&
+                        hb_fs_exists("/Data/YouTubeStreamer-audio-only-test");
+    if (native && hb_fs_exists("/Data/YouTubeStreamer-long-audio-blocks"))
+        stream.audio_block_ms = 200u;
+#endif
     stream.adpcm = adpcm;
     stream.groups = native ? MAX_VIDEO_GROUPS : LIVE_GROUPS;
     stream.group_frames = group_frames;
@@ -1915,7 +1982,7 @@ static bool begin_group_playback(const uint8_t *config, uint32_t size, uint32_t 
     }
     /* Allocate the mixer's PCM before RGB frames. Allocating at the first
        display can consume part of the decoder's only large free region. */
-    if (native && !en_audio_reserve_video_buffers()) {
+    if (native && !en_audio_reserve_video_buffers(stream.audio_block_ms)) {
         live_playback_error = startup_failure("Not enough memory for video audio.", config, size, fps, rate, channels);
         hb_h264_live_stop();
         return false;
@@ -1999,6 +2066,8 @@ static bool begin_group_playback(const uint8_t *config, uint32_t size, uint32_t 
     stream.awake = true;
 #ifdef NANO_YOUTUBE_VIDEO
     memset(&video_perf, 0, sizeof(video_perf));
+    video_perf.min_free = video_perf.min_largest = UINT32_MAX;
+    video_perf.last_snapshot_ms = hb_time_uptime_ms();
     video_perf.active = true;
 #endif
     return true;
@@ -2023,7 +2092,8 @@ void hb_h264_live_stop(void)
     if (stream.direct_display && !hb_video_layer_close()) {
         stream.closing = stream.cancelled = true;
         if (stream.started) {
-            en_audio_shutdown();
+            if (stream_uses_mixer())
+                en_audio_shutdown();
             stream.started = false;
         }
         if (!stream.timer)
@@ -2033,7 +2103,7 @@ void hb_h264_live_stop(void)
 #endif
     if (stream.timer)
         lv_timer_delete(stream.timer);
-    if (stream.started)
+    if (stream.started && stream_uses_mixer())
         en_audio_shutdown();
     if (stream.pending_pool)
         release_decode_pool(stream.pending_pool, NULL);
@@ -2084,7 +2154,7 @@ static uint32_t live_refill_frames(void)
 
 static void service_live_audio(void)
 {
-    if (!stream.started || stream.cancelled)
+    if (!stream.started || stream.cancelled || !stream_uses_mixer())
         return;
     uint32_t played = (uint32_t)(en_audio_elapsed() * stream.fps);
     en_audio_tick_with_refill(stream.loaded == stream.count ||
@@ -2120,6 +2190,16 @@ static uint32_t pull_stream_audio(int16_t *pcm, uint32_t frames, uint32_t advanc
         return stream.loaded == stream.count ? 0 : EN_AUDIO_PULL_WAIT;
     if (frames > end - stream.audio_frame)
         frames = end - stream.audio_frame;
+
+#ifdef NANO_YOUTUBE_VIDEO
+    if (stream.mixer_silence) {
+        /* Exercise the same PCM handoffs, timing and backpressure without
+           decoding the encoded audio or reading samples from the audio ring. */
+        memset(pcm, 0, frames * 2u * sizeof(*pcm));
+        stream.audio_frame += frames;
+        return frames;
+    }
+#endif
 
     uint64_t sample = stream.audio_frame / stream.repeat;
     unsigned phase = stream.audio_frame % stream.repeat;
@@ -2171,8 +2251,13 @@ bool hb_h264_live_room(void)
 #ifdef HB_VIDEO_LAYER
     if (stream.direct_display) {
         uint64_t boundary = live_audio_boundary((uint64_t)(group - stream.groups + 1u) * stream.group_frames);
-        if (!hb_video_layer_idle() || stream.audio_frame < boundary * stream.repeat)
+        if (stream_uses_mixer() && stream.audio_frame < boundary * stream.repeat)
             return false;
+#ifdef NANO_YOUTUBE_VIDEO
+        if (!stream.audio_only)
+#endif
+            if (!hb_video_layer_idle())
+                return false;
     }
 #endif
     return true;
@@ -2222,8 +2307,42 @@ static void record_group_decode(uint32_t elapsed)
     hb_trace_log("VDecMs", stream.loaded, elapsed / 1000u);
 #ifdef NANO_YOUTUBE_VIDEO
     measure_duration(&video_perf.group, elapsed);
+    uint32_t now = hb_time_uptime_ms();
+    if (now - video_perf.last_snapshot_ms >= 5000u) {
+        video_perf.last_snapshot_ms = now;
+        char report[448];
+        unsigned queued, mixer_mask;
+        en_audio_queue_status(&queued, &mixer_mask);
+        int length = lv_snprintf(report, sizeof(report),
+            "Snapshot %u at %lu ms uptime\n%s, %u x %u at %lu FPS, %lu Hz%s\n"
+            "Group starts at frame %lu. Last frame shown: %lu\n"
+            "Before group processing (bytes), free: %lu, largest: %lu\n"
+            "Lowest observed (bytes), free: %lu, largest: %lu\n"
+            "Last group decode: %lu us\n"
+            "Audio state: %u, queue: %u, mixer: %x, block: %u ms, immutable: %u, linked: %u\n",
+            video_perf.snapshots + 1u, (unsigned long)now,
+            stream.from_disk ? "After Transfer" : "While Sending",
+            stream.width, stream.height, (unsigned long)stream.fps, (unsigned long)stream.rate,
+            stream_audio_test_label(),
+            (unsigned long)stream.loaded, (unsigned long)stream.shown,
+            (unsigned long)video_perf.heap_free, (unsigned long)video_perf.heap_largest,
+            (unsigned long)video_perf.min_free, (unsigned long)video_perf.min_largest,
+            (unsigned long)elapsed, (unsigned)en_audio_state(), queued, mixer_mask, stream.audio_block_ms,
+            (unsigned)en_audio_uses_immutable_pcm(), (unsigned)en_audio_uses_linked_pcm());
+        const char *path = video_perf.snapshots % 2u ? "/Data/YouTubeStreamer-heap-b.txt" :
+                                                     "/Data/YouTubeStreamer-heap-a.txt";
+        if (length > 0 && (unsigned)length < sizeof(report) && hb_fs_write(path, report, (uint32_t)length))
+            video_perf.snapshots++;
+    }
 #endif
 }
+
+#ifdef NANO_YOUTUBE_VIDEO
+static void trace_group_start(void)
+{
+    hb_trace_log(stream.from_disk ? "VDiskGrp" : "VLiveGrp", stream.loaded, stream.shown);
+}
+#endif
 
 static const char *prepare_live_frame(const h264_clip *clip, const decoder_frame *frame, unsigned index)
 {
@@ -2248,6 +2367,9 @@ const char *hb_h264_live_group(bool (*read)(void *, uint32_t, void *), void *con
     const char *error = read_live_group(&clip, read, context, length);
     if (error)
         return error;
+#ifdef NANO_YOUTUBE_VIDEO
+    trace_group_start();
+#endif
     uint32_t started = hb_time_uptime_us();
 #ifdef HB_VIDEO_LAYER
     if (stream.direct_display) {
@@ -2280,6 +2402,21 @@ const char *hb_h264_live_queue(bool (*read)(void *, uint32_t, void *), void *con
     const char *error = read_live_group(&stream.pending_clip, read, context, length);
     if (error)
         return error;
+#ifdef NANO_YOUTUBE_VIDEO
+    trace_group_start();
+    if (stream.audio_only) {
+        uint32_t free = hb_os_heap_free(), largest = hb_os_heap_largest();
+        video_perf.heap_free = free;
+        video_perf.heap_largest = largest;
+        if (free < video_perf.min_free)
+            video_perf.min_free = free;
+        if (largest < video_perf.min_largest)
+            video_perf.min_largest = largest;
+        record_group_decode(0);
+        stream.loaded += stream.pending_clip.count;
+        return NULL;
+    }
+#endif
     uint32_t started = hb_time_uptime_us();
     error = decode_to_planes(&stream.pending_clip, stream.pending_frames, &stream.pending_pool);
     if (error == decoder_low_memory)
@@ -2339,32 +2476,80 @@ int hb_h264_live_tick(void)
         uint32_t opening_frames = stream.native ? stream.groups * stream.group_frames : live_refill_frames();
         if (stream.loaded < opening_frames && stream.loaded < stream.count)
             return 0;
+#ifdef NANO_YOUTUBE_VIDEO
+        stream.canvas = open_movie_canvas(stream.direct_display || stream.audio_only);
+#else
         stream.canvas = open_movie_canvas(stream.direct_display);
+#endif
         if (!stream.canvas) {
             live_playback_error = "Could not open the video display.";
             return -1;
         }
         lv_obj_add_event_cb(stream.canvas, live_canvas_deleted, LV_EVENT_DELETE, NULL);
+#ifdef NANO_YOUTUBE_VIDEO
+        if (stream.audio_only) {
+            lv_obj_t *label = lv_label_create(stream.canvas);
+            lv_label_set_text(label, "Audio-only test");
+            lv_obj_center(label);
+        }
+#endif
         stream.started = true;
-        uint32_t output_rate = stream.rate * stream.repeat;
-        bool audio_started = stream.native ? en_audio_start_video_stream(output_rate, pull_stream_audio, NULL) :
-                                             en_audio_start_live_stream(output_rate, pull_stream_audio, NULL);
-        if (!audio_started) {
-            live_playback_error = "Could not start video audio.";
-            return -1;
+#ifdef NANO_YOUTUBE_VIDEO
+        stream.video_started_at = lv_tick_get();
+#endif
+        if (stream_uses_mixer()) {
+            uint32_t output_rate = stream.rate * stream.repeat;
+            int linked = 0;
+#ifdef NANO_YOUTUBE_VIDEO
+            /* Preserve the contiguous region used by the hardware decoder. */
+            unsigned pool_bytes = stream.native ? NATIVE_POOL_BYTES : POOL_BYTES;
+            /* Two blocks must fit even when the last displayed frame pins
+               a group during an underrun. Leave slack for frame rounding. */
+            unsigned block_ms = live_refill_frames() * 1000u / stream.fps >= 250u ? 120u : 60u;
+            if (hb_os_heap_largest() >= pool_bytes + DECODER_HEAP_MARGIN + PLAYBACK_HEAP_MARGIN)
+                linked = en_audio_start_linked_video(output_rate, pull_stream_audio, NULL, block_ms);
+            if (linked > 0)
+                stream.audio_block_ms = block_ms;
+#endif
+            bool audio_started = linked ? linked > 0 : stream.native ?
+                en_audio_start_video_stream(output_rate, pull_stream_audio, NULL, stream.audio_block_ms) :
+                en_audio_start_live_stream(output_rate, pull_stream_audio, NULL);
+            if (!audio_started) {
+                live_playback_error = "Could not start video audio.";
+                return -1;
+            }
         }
     }
-    service_live_audio();
-    if (en_audio_state() == EN_AUDIO_FAILED) {
-        live_playback_error = "Video audio stopped.";
-        return -1;
+    double elapsed;
+#ifdef NANO_YOUTUBE_VIDEO
+    if (stream.silent) {
+        uint32_t now = video_paused ? video_paused_at : lv_tick_get();
+        uint32_t ms = now - stream.video_started_at;
+        uint64_t frame = (uint64_t)ms * stream.fps / 1000u;
+        if (frame >= stream.loaded) {
+            if (stream.loaded == stream.count)
+                return 1;
+            ms = (uint64_t)(stream.loaded - 1u) * 1000u / stream.fps + 1u;
+            stream.video_started_at = now - ms;
+        }
+        elapsed = ms / 1000.0;
+    } else
+#endif
+    {
+        service_live_audio();
+        if (en_audio_state() == EN_AUDIO_FAILED) {
+            live_playback_error = "Video audio stopped.";
+            return -1;
+        }
+        if (en_audio_state() == EN_AUDIO_IDLE)
+            return 1;
+        /* The linked mixer reports its PCM cursor. It holds that position
+           while waiting for data or paused, so video stops with the audio. */
+        elapsed = en_audio_elapsed();
     }
-    if (en_audio_state() == EN_AUDIO_IDLE)
-        return 1;
-    double elapsed = en_audio_elapsed();
     unsigned frame = elapsed * stream.fps;
 #ifdef NANO_YOUTUBE_VIDEO
-    if (!video_paused) {
+    if (!video_paused && stream_uses_mixer()) {
         bool buffering = en_audio_stream_buffering();
         if (buffering && !video_perf.buffering)
             video_perf.stalls++;
@@ -2376,6 +2561,12 @@ int hb_h264_live_tick(void)
 #endif
     if (frame >= stream.loaded)
         frame = stream.loaded - 1u;
+#ifdef NANO_YOUTUBE_VIDEO
+    if (stream.audio_only) {
+        stream.shown = frame;
+        return 0;
+    }
+#endif
     bool controls_visible = false;
 #ifdef HB_VIDEO_LAYER
 #ifdef NANO_VIDEO_STREAM
@@ -2500,7 +2691,7 @@ static void advance_spooled_stream(lv_timer_t *timer)
     }
     const char *error = "Invalid H.264 group in the saved video.";
     bool serviced = stream.started && !stream.cancelled;
-    if (serviced && !stream.audio_eof_logged && stream.loaded == stream.count &&
+    if (serviced && stream_uses_mixer() && !stream.audio_eof_logged && stream.loaded == stream.count &&
         stream.audio_frame == live_audio_boundary(stream.loaded) * stream.repeat) {
         stream.audio_eof_logged = true;
         log_saved_video_end("Final audio samples handed to the mixer");
@@ -2557,7 +2748,7 @@ static void advance_spooled_stream(lv_timer_t *timer)
 #endif
         const uint8_t *data = stream.disk_group;
         if (last_group)
-            log_saved_video_end("Submitting the final video group to the hardware decoder");
+            log_saved_video_end("Processing the final saved group");
         error = hb_h264_live_queue(read_group_memory, &data, length);
         if (error)
             goto invalid;

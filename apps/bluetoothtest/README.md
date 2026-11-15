@@ -44,8 +44,8 @@ running firmware 1.1.2 (`39A10023`).
 
 ### Play a clip from the Mac
 
-Open the [Nano UART Sender](../../downloads/nano-uart-sender-macos-arm64.zip)
-on an Apple silicon Mac running macOS 15 or later. Connect to **Nano UART**
+Open the [Nano Bluetooth Link](../../downloads/Nano%20Bluetooth%20Link.app)
+on an Apple silicon Mac running macOS 15 or later. Connect to **Nano Bluetooth Link**
 on the iPod. When the Mac shows **Subscribed**, click **Send Audio…** and
 choose a clip up to 30 seconds long. The Mac converts it to mono 22.05 kHz
 IMA ADPCM for transfer. The iPod checks the packet offsets and checksum, then

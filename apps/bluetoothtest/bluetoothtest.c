@@ -177,7 +177,7 @@ static void select_classic_address(const uint8_t address[6])
     lv_label_set_text(connect_label, LISTEN_LABEL);
     lv_obj_remove_state(connect_button, LV_STATE_DISABLED);
 #ifdef NANO_STREAM
-    lv_label_set_text(status_label, "Tap Listen, then click Connect in Nano UART Sender.");
+    lv_label_set_text(status_label, "Tap Listen, then click Connect in Nano Bluetooth Link.");
 #else
     lv_label_set_text(status_label, "Tap Listen Classic, then connect from the Mac.");
 #endif
@@ -565,7 +565,7 @@ static void scan_ble(void)
         char label[96];
         uint8_t mac[6];
         if (mac_beacon_address(device->name, mac)) {
-            lv_snprintf(label, sizeof(label), "Nano UART Sender\n%02X:%02X:%02X:%02X:%02X:%02X",
+            lv_snprintf(label, sizeof(label), "Nano Bluetooth Link\n%02X:%02X:%02X:%02X:%02X:%02X",
                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 #ifdef NANO_STREAM
             mac_count++;
@@ -593,7 +593,7 @@ static void scan_ble(void)
     else if (mac_count)
         lv_label_set_text(status_label, "Tap the Mac to start listening.");
     else
-        lv_label_set_text(status_label, "No Mac found. Open Classic Files in Nano UART Sender.");
+        lv_label_set_text(status_label, "No Mac found. Open the matching media tab in Nano Bluetooth Link.");
 #else
     else if (count)
         lv_label_set_text_fmt(status_label, "%u named BLE devices.\nTap one to select it.", count);
@@ -628,7 +628,7 @@ static void run_ble_test(lv_event_t *event)
     lv_obj_add_state(address_button, LV_STATE_DISABLED);
     clear_results();
 #ifdef NANO_STREAM
-    lv_label_set_text(status_label, "Looking for Nano UART Sender…");
+    lv_label_set_text(status_label, "Looking for Nano Bluetooth Link…");
 #else
     lv_label_set_text(status_label, "Scanning for BLE devices...\nWait 5 seconds.");
 #endif
@@ -790,7 +790,7 @@ static void open_classic_inbox(lv_event_t *event)
     }
     if (!found) {
         lv_obj_add_flag(list, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(classic_inbox_status, "No WAV files. Send audio from Classic Files on the Mac.");
+        lv_label_set_text(classic_inbox_status, "No WAV files in the Classic inbox.");
     }
     lv_obj_t *close = lv_msgbox_add_footer_button(classic_inbox, "Close");
     lv_obj_add_event_cb(close, close_classic_inbox, LV_EVENT_CLICKED, NULL);
@@ -1290,12 +1290,12 @@ HB_APP_ENTRY(payload_entry)
         hb_shared->prepare_unload = prepare_unload;
     }
 #if defined(NANO_YOUTUBE_VIDEO)
-    lv_label_set_text(title, "YouTube Streamer");
+    lv_label_set_text(title, "YT Video");
 #elif defined(NANO_VIDEO_STREAM)
     lv_label_set_text(title, "VideoStream");
 #else
 #ifdef NANO_YOUTUBE_AUDIO
-    lv_label_set_text(title, "YouTube Audio");
+    lv_label_set_text(title, "YT Music");
 #else
     lv_label_set_text(title, "Stream");
 #endif
@@ -1326,7 +1326,7 @@ HB_APP_ENTRY(payload_entry)
     lv_obj_add_flag(video_progress_spinner, LV_OBJ_FLAG_HIDDEN);
 #endif
 #ifdef NANO_STREAM
-    lv_label_set_text(status_label, "Open Nano UART Sender on the Mac.");
+    lv_label_set_text(status_label, "Open Nano Bluetooth Link on the Mac.");
 #else
     lv_label_set_text(status_label, "Choose a Bluetooth test.");
 #endif

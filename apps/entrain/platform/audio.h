@@ -110,15 +110,26 @@ bool en_audio_start_stream(uint32_t sample_rate, en_audio_pull_fn pull,
 /* Device backend. Fill the available PCM slots before starting the voice.
    Intended for disk playback where occasional reads can stall a UI tick. */
 bool en_audio_start_buffered_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx);
+#ifdef HB_LINKED_PCM
+/* Sources with a known length can use distinct descriptors and reuse only
+   the sample arrays. Live sources may temporarily return EN_AUDIO_PULL_WAIT. */
+bool en_audio_start_linked_stream(uint32_t rate, uint64_t frames, en_audio_pull_fn pull,
+                                  void *ctx, bool live);
+bool en_audio_uses_linked_pcm(void);
+bool en_audio_stop_linked_stream(void);
+/* A return of zero lets the caller fall back before consuming any samples. */
+int en_audio_start_linked_video(uint32_t rate, en_audio_pull_fn pull, void *ctx, unsigned block_ms);
+#endif
 
 /* Device backend. The source may return EN_AUDIO_PULL_WAIT when it has no
    samples yet. Zero still marks end of stream. */
 #define EN_AUDIO_PULL_WAIT UINT32_MAX
 bool en_audio_start_live_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx);
 /* Device backend. Start with shorter PCM blocks for a small video frame queue. */
-bool en_audio_reserve_video_buffers(void);
-bool en_audio_start_video_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx);
+bool en_audio_reserve_video_buffers(unsigned block_ms);
+bool en_audio_start_video_stream(uint32_t rate, en_audio_pull_fn pull, void *ctx, unsigned block_ms);
 bool en_audio_stream_buffering(void);
+bool en_audio_uses_immutable_pcm(void);
 /* Device diagnostics. Bit i of playing_mask is the firmware flag for slot i. */
 void en_audio_queue_status(unsigned *queued, unsigned *playing_mask);
 /* Device backend only. On underrun, wait for a refill before pulling again. */

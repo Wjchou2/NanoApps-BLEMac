@@ -233,6 +233,7 @@ static struct {
     bool mulaw;
     uint32_t trace_ms;
     uint32_t ima_frames_left;
+    bool stopping_audio;
     unsigned ima_channels, ima_samples_per_block, ima_cursor, ima_ready;
     uint8_t ima_block[IMA_BLOCK_SIZE];
     int16_t ima_pcm[2041u * 2u];
@@ -1227,6 +1228,10 @@ static void incoming(unsigned psm, const uint8_t *address, unsigned cid)
 }
 
 #ifdef NANO_STREAM
+#ifdef NANO_YOUTUBE_AUDIO
+static void close_audio_spool(void);
+#endif
+
 void hb_classic_init_media(void)
 {
     en_audio_init();
@@ -1243,6 +1248,10 @@ static int prepare_media_unload(void)
         video_stream_reset();
 #endif
     }
+#ifdef NANO_YOUTUBE_AUDIO
+    close_audio_spool();
+    live.stopping_audio = false;
+#endif
     live.playing = false;
     return 1;
 }
@@ -1435,6 +1444,13 @@ static uint32_t audio_wire_rate(void)
     return live.rate * live.stride;
 }
 
+static uint64_t audio_output_frames(void)
+{
+    uint32_t samples = live.ima_channels ? live.ima_frames_left :
+        (live.audio_end - live.audio_header) / live.stride;
+    return (uint64_t)samples * live.copies;
+}
+
 static bool decode_ima_block(const uint8_t *block)
 {
     unsigned channels = live.ima_channels;
@@ -1561,11 +1577,11 @@ static void report_audio_progress(enum audio_report_stage stage)
     uint32_t consumed = __atomic_load_n(&link.written, __ATOMIC_RELAXED);
     unsigned queued, mixer_mask;
     en_audio_queue_status(&queued, &mixer_mask);
-    char line[320];
+    char line[352];
     int size = lv_snprintf(line, sizeof(line),
         "#%u %u ms %s transfer=%08x rx=%u/%u consumed=%u ring=%u "
         "credit=%u rate=%u elapsed=%us audio=%u queue=%u mixer=%x buffering=%u "
-        "link=%u mode=%u close=%x heap=%u largest=%u credit_errors=%u last=%x %.55s\n",
+        "link=%u mode=%u close=%x heap=%u largest=%u credit_errors=%u last=%x immutable=%u gapless=%u %.55s\n",
         ++audio_report.sequence, (unsigned)now, labels[stage], (unsigned)link.credit_token,
         (unsigned)received, (unsigned)link.size, (unsigned)consumed,
         (unsigned)(received >= consumed ? received - consumed : 0),
@@ -1574,7 +1590,8 @@ static void report_audio_progress(enum audio_report_stage stage)
         (unsigned)en_audio_state(), queued, mixer_mask, (unsigned)en_audio_stream_buffering(),
         state(), (unsigned)link.audio_mode, link.close_reason,
         (unsigned)hb_os_heap_free(), (unsigned)hb_os_heap_largest(),
-        link.credit_errors, link.credit_last_error,
+        link.credit_errors, link.credit_last_error, (unsigned)en_audio_uses_immutable_pcm(),
+        (unsigned)en_audio_uses_linked_pcm(),
         stage == AUDIO_FAILED && link.failure ? link.failure : "");
     if (size <= 0 || (unsigned)size >= sizeof(line))
         return;
@@ -1616,11 +1633,14 @@ static void close_audio_spool(void)
 #ifdef NANO_YOUTUBE_AUDIO
 bool hb_classic_audio_playing(void) { return live.playing; }
 
-bool hb_classic_audio_paused(void) { return en_audio_state() == EN_AUDIO_PAUSED; }
+bool hb_classic_audio_paused(void)
+{
+    return !live.stopping_audio && en_audio_state() == EN_AUDIO_PAUSED;
+}
 
 void hb_classic_audio_toggle_pause(void)
 {
-    if (live.playing)
+    if (live.playing && !live.stopping_audio)
         en_audio_set_stream_paused(!hb_classic_audio_paused());
 }
 
@@ -1633,6 +1653,11 @@ void hb_classic_audio_stop(void)
 {
     if (!live.playing)
         return;
+    if (en_audio_uses_linked_pcm() && !en_audio_stop_linked_stream()) {
+        live.stopping_audio = true;
+        return;
+    }
+    live.stopping_audio = false;
     report_audio_progress(AUDIO_STOPPED);
     en_audio_shutdown();
     close_audio_spool();
@@ -1752,8 +1777,11 @@ static const char *spool_audio(uint32_t received)
         link.written = live.audio_header;
 #ifdef NANO_YOUTUBE_AUDIO
         report_audio_progress(AUDIO_STARTING_SAVED);
-#endif
+        if (!en_audio_start_linked_stream(live.output_rate, audio_output_frames(),
+                                          pull_saved_audio, NULL, false)) {
+#else
         if (!en_audio_start_buffered_stream(live.output_rate, pull_saved_audio, NULL)) {
+#endif
             hb_wake_lock(false);
             goto failed;
         }
@@ -2385,6 +2413,12 @@ static const char *poll_live(unsigned current)
     }
     if (current != RECEIVING && current != READY)
         return NULL;
+#ifdef NANO_YOUTUBE_AUDIO
+    if (live.stopping_audio) {
+        hb_classic_audio_stop();
+        return live.playing ? "Stopping audio..." : "Audio stopped.";
+    }
+#endif
 #ifdef NANO_VIDEO_STREAM
     if (link.progressive)
         return poll_progressive(__atomic_load_n(&link.received, __ATOMIC_ACQUIRE), current == READY);
@@ -2486,8 +2520,12 @@ static const char *poll_live(unsigned current)
 #endif
 #ifdef NANO_YOUTUBE_AUDIO
         report_audio_progress(AUDIO_STARTING_LIVE);
-#endif
+        if (!en_audio_start_linked_stream(live.output_rate,
+                                          audio_output_frames() + live.startup_silence,
+                                          pull_live, NULL, true)) {
+#else
         if (!en_audio_start_live_stream(live.output_rate, pull_live, NULL)) {
+#endif
 #ifdef NANO_VIDEO_STREAM
             video_stream_reset();
 #endif
@@ -2509,6 +2547,12 @@ static const char *poll_live(unsigned current)
     uint32_t refill = bytes_per_second * 3u;
     if (refill > RING_CAPACITY / 2u)
         refill = RING_CAPACITY / 2u;
+#ifdef NANO_YOUTUBE_AUDIO
+    /* A paced sender can remain paused above its low watermark. A restart
+       has to be possible even if the current buffer is all we can receive. */
+    if (link.mac_paced_audio && refill > AUDIO_LIVE_RESUME_WATERMARK)
+        refill = AUDIO_LIVE_RESUME_WATERMARK;
+#endif
     en_audio_tick_with_refill(live.verified || buffered >= refill);
 #ifdef NANO_YOUTUBE_AUDIO
     report_audio_progress(AUDIO_PLAYING_LIVE);
