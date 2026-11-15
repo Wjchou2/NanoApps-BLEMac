@@ -2,6 +2,9 @@ AI was used in the making of this project.
 
 Built on top of [NanoApps](https://github.com/nfzerox/NanoApps/tree/main)!
 
+[![Watch Demo](https://img.youtube.com/vi/iSb-xPEHeis/maxresdefault.jpg)](https://www.youtube.com/watch?v=iSb-xPEHeis)
+
+
 # NanoApps Bluetooth and Media
 
 Send audio, video, and text between a Mac and a seventh-generation iPod nano. **YT Music** and **YT Video** use Bluetooth Classic for media transfers. **BLE Chat** and **Bluetooth Test** use Bluetooth Low Energy for text and short audio tests. The Mac handles YouTube search, downloads, and conversion. The Nano handles buffering, sound, and hardware H.264 playback.
