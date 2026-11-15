@@ -1,6 +1,7 @@
 AI was used in the making of this project. 
 
 Built on top of [NanoApps](https://github.com/nfzerox/NanoApps/tree/main)!
+# Demo Video
 
 [![Watch Demo](https://img.youtube.com/vi/iSb-xPEHeis/maxresdefault.jpg)](https://www.youtube.com/watch?v=iSb-xPEHeis)
 
